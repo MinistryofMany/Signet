@@ -1,0 +1,78 @@
+# Network-isolated deployment of Signet alongside FreedInk.
+#
+# Isolation model:
+#   - `signet-internal` is an INTERNAL docker network (no egress, no host
+#     publish). Only services attached to it can reach the signer.
+#   - The `signet` service publishes NO host ports. It is reachable only as
+#     `https://signet:8443` from inside `signet-internal`.
+#   - FreedInk (the only relying party permitted to sign) is attached to
+#     `signet-internal` and holds the client certificate. Everything else on the
+#     host cannot route to the signer at all.
+#
+# This compose shows the signer plus a representative FreedInk service so the
+# wiring is explicit. In a real deployment, merge the `freedink` block into your
+# existing FreedInk compose and just attach it to `signet-internal`.
+
+services:
+  signet:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    # NOTE: no `ports:` mapping — deliberately not published to the host.
+    networks:
+      - signet-internal
+    environment:
+      SIGNET_BIND: "0.0.0.0:8443"
+      SIGNET_DB: "/data/signet.db"
+      SIGNET_TLS_CERT: "/certs/server.pem"
+      SIGNET_TLS_KEY: "/certs/server.key"
+      SIGNET_CLIENT_CA: "/certs/ca.pem"
+      # KEK is injected from the host environment / secret store, NEVER baked in.
+      # Provide it via an .env file or your orchestrator's secret mechanism.
+      SIGNET_KEK: "${SIGNET_KEK:?SIGNET_KEK must be set (32 bytes hex or base64)}"
+      SIGNET_KEY_BITS: "2048"
+      SIGNET_AUTO_CREATE_KEYS: "true"
+      SIGNET_RL_PARTICIPANT_MAX: "5"
+      SIGNET_RL_GLOBAL_MAX: "1000"
+      SIGNET_RL_WINDOW_SECS: "60"
+      RUST_LOG: "info"
+    volumes:
+      # Persistent encrypted-at-rest key DB.
+      - signet-data:/data
+      # Server cert/key + client CA. Generate with deploy/gen-dev-certs.sh.
+      - ./certs:/certs:ro
+    restart: unless-stopped
+    # The healthcheck would need the client cert; we keep it simple and rely on
+    # the process exiting non-zero on fatal config errors.
+
+  # Representative FreedInk relying party. Replace with your real FreedInk
+  # service definition; the load-bearing parts are the network attachment and
+  # the client certificate mount + env.
+  freedink:
+    image: freedink:local
+    networks:
+      - signet-internal
+      - default
+    environment:
+      # Where FreedInk reaches the signer (internal DNS name == server cert SAN).
+      SIGNET_BASE_URL: "https://signet:8443"
+      # FreedInk presents this client cert; the signer rejects anyone else.
+      SIGNET_CLIENT_CERT: "/signet-certs/client.pem"
+      SIGNET_CLIENT_KEY: "/signet-certs/client.key"
+      SIGNET_CA: "/signet-certs/ca.pem"
+    volumes:
+      - ./certs:/signet-certs:ro
+    depends_on:
+      - signet
+    restart: unless-stopped
+
+networks:
+  # Internal-only: `internal: true` removes the external/default gateway, so
+  # this network has no route to the host or the internet. Only co-attached
+  # services can talk to the signer.
+  signet-internal:
+    internal: true
+  default: {}
+
+volumes:
+  signet-data: {}
