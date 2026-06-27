@@ -8,6 +8,7 @@
 use crate::keystore::Kek;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use zeroize::Zeroize;
 
 #[derive(Clone)]
 pub struct Config {
@@ -56,9 +57,22 @@ impl Config {
         let tls_key = PathBuf::from(env_required("SIGNET_TLS_KEY")?);
         let client_ca = PathBuf::from(env_required("SIGNET_CLIENT_CA")?);
 
-        let kek_raw = env_required("SIGNET_KEK")?;
-        let kek = Kek::from_encoded(&kek_raw)
-            .map_err(|e| format!("SIGNET_KEK is invalid: {e}"))?;
+        let mut kek_raw = env_required("SIGNET_KEK")?;
+        let kek_result = Kek::from_encoded(&kek_raw);
+        // Wipe the encoded KEK from our heap copy as soon as it is parsed,
+        // regardless of whether parsing succeeded, so the raw key material does
+        // not linger in process memory.
+        kek_raw.zeroize();
+        // Remove the KEK from the process environment so it is not readable via
+        // /proc/<pid>/environ, inherited by any child process, or surfaced by a
+        // crash dump that walks the environment block. The in-memory `Kek` is
+        // the only remaining copy and is itself zeroized on drop.
+        //
+        // SAFETY: `remove_var` is sound here because config loading happens once
+        // at startup, before any worker threads that might read the environment
+        // are spawned (see `main::run`), so there is no concurrent env access.
+        std::env::remove_var("SIGNET_KEK");
+        let kek = kek_result.map_err(|e| format!("SIGNET_KEK is invalid: {e}"))?;
 
         let key_bits: usize = env_or("SIGNET_KEY_BITS", 2048usize)?;
         if !(2048..=4096).contains(&key_bits) || !key_bits.is_multiple_of(16) {
