@@ -155,22 +155,16 @@ mod tests {
         let k = key();
         let pk = public_key_from_spki(&k.spki_der).unwrap();
         let sk = SecretKey::from_der(&k.pkcs8_der).unwrap();
-        let kp = KeyPair {
-            pk,
-            sk,
-        };
+        let kp = KeyPair { pk, sk };
         let info = version_info("post-v1");
         let derived = kp.derive_key_pair_for_metadata(&info).unwrap();
 
         let msg = b"unblinded-token-nonce";
-        let blinding = derived
-            .pk
-            .blind(&mut DefaultRng, msg, Some(&info))
-            .unwrap();
+        let blinding = derived.pk.blind(&mut DefaultRng, msg, Some(&info)).unwrap();
 
         // Service path: only the master PKCS#8 + blinded message + version_id.
-        let blind_sig = blind_sign(&k.pkcs8_der, "post-v1", blinding.blind_message.as_ref())
-            .unwrap();
+        let blind_sig =
+            blind_sign(&k.pkcs8_der, "post-v1", blinding.blind_message.as_ref()).unwrap();
         let blind_sig = blind_rsa_signatures::BlindSignature(blind_sig);
 
         let sig = derived
@@ -189,10 +183,7 @@ mod tests {
         let k = key();
         let sk = SecretKey::from_der(&k.pkcs8_der).unwrap();
         let pk = public_key_from_spki(&k.spki_der).unwrap();
-        let kp = KeyPair {
-            pk,
-            sk,
-        };
+        let kp = KeyPair { pk, sk };
         let info_v1 = version_info("post-v1");
         let derived_v1 = kp.derive_key_pair_for_metadata(&info_v1).unwrap();
 
@@ -212,7 +203,9 @@ mod tests {
         // Verify under v2 metadata: must fail.
         let info_v2 = version_info("post-v2");
         let derived_v2 = kp.derive_key_pair_for_metadata(&info_v2).unwrap();
-        let res = derived_v2.pk.verify(&sig, blinding.msg_randomizer, msg, Some(&info_v2));
+        let res = derived_v2
+            .pk
+            .verify(&sig, blinding.msg_randomizer, msg, Some(&info_v2));
         assert!(res.is_err(), "v1 token must not verify under v2 metadata");
     }
 }

@@ -58,7 +58,13 @@ impl Kek {
         let aad = associated_data(group_id, key_id);
         let ct = self
             .cipher()
-            .encrypt(nonce, Payload { msg: plaintext, aad: &aad })
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: plaintext,
+                    aad: &aad,
+                },
+            )
             .map_err(|_| "AES-GCM encryption failed".to_string())?;
         let mut out = Vec::with_capacity(1 + NONCE_LEN + ct.len());
         out.push(BLOB_VERSION);
@@ -115,7 +121,11 @@ mod tests {
         let kek = test_kek();
         let pt = b"pretend-this-is-pkcs8-der";
         let blob = kek.seal("blog-1", 3, pt).unwrap();
-        assert_ne!(&blob[1 + NONCE_LEN..], pt, "ciphertext must differ from plaintext");
+        assert_ne!(
+            &blob[1 + NONCE_LEN..],
+            pt,
+            "ciphertext must differ from plaintext"
+        );
         let out = kek.open("blog-1", 3, &blob).unwrap();
         assert_eq!(out, pt);
     }
@@ -124,8 +134,14 @@ mod tests {
     fn aad_binding_rejects_wrong_identity() {
         let kek = test_kek();
         let blob = kek.seal("blog-1", 3, b"secret").unwrap();
-        assert!(kek.open("blog-2", 3, &blob).is_err(), "wrong group must fail");
-        assert!(kek.open("blog-1", 4, &blob).is_err(), "wrong key id must fail");
+        assert!(
+            kek.open("blog-2", 3, &blob).is_err(),
+            "wrong group must fail"
+        );
+        assert!(
+            kek.open("blog-1", 4, &blob).is_err(),
+            "wrong key id must fail"
+        );
     }
 
     #[test]

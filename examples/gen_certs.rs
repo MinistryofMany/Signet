@@ -89,8 +89,14 @@ fn main() {
     write(out, "client.key", &client_key.serialize_pem());
 
     eprintln!("wrote CA + server + client certs to {}", out.display());
-    eprintln!("server SANs: signet, localhost, 127.0.0.1{}",
-        if extra_sans.is_empty() { String::new() } else { format!(", {}", extra_sans.join(", ")) });
+    eprintln!(
+        "server SANs: signet, localhost, 127.0.0.1{}",
+        if extra_sans.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", extra_sans.join(", "))
+        }
+    );
 }
 
 fn write(dir: &Path, name: &str, contents: &str) {

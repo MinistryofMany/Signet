@@ -8,13 +8,11 @@
 //!
 //! These mirror exactly what the production service does in `crypto.rs`.
 
-use blind_rsa_signatures::pbrsa::{
-    DefaultRng, PartiallyBlindKeyPair, PartiallyBlindSecretKey,
-};
-use blind_rsa_signatures::reexports::rsa::traits::PublicKeyParts;
-use blind_rsa_signatures::{BlindSignature, Randomized, Sha384, PSS};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
+use blind_rsa_signatures::pbrsa::{DefaultRng, PartiallyBlindKeyPair, PartiallyBlindSecretKey};
+use blind_rsa_signatures::reexports::rsa::traits::PublicKeyParts;
+use blind_rsa_signatures::{BlindSignature, Randomized, Sha384, PSS};
 use std::io::Read;
 
 type KeyPair = PartiallyBlindKeyPair<Sha384, PSS, Randomized>;
@@ -46,7 +44,11 @@ fn main() {
             let kp = gen_full(2048);
             let spki = kp.pk.to_der().unwrap();
             let pkcs8 = kp.sk.to_der().unwrap();
-            println!("{{\"spki\":\"{}\",\"pkcs8\":\"{}\"}}", b64(&spki), b64(&pkcs8));
+            println!(
+                "{{\"spki\":\"{}\",\"pkcs8\":\"{}\"}}",
+                b64(&spki),
+                b64(&pkcs8)
+            );
         }
         "sign" => {
             let pkcs8 = unb64(&std::env::var("PKCS8").expect("PKCS8 env required"));
