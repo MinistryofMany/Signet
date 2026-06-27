@@ -30,10 +30,20 @@ pub enum Decision {
 }
 
 fn now_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
+        Err(e) => {
+            // Clock before the unix epoch: `since = 0 - window` goes negative,
+            // so every issuance row falls inside the window and the ceilings
+            // count *all* rows. That fails closed (more likely to deny), which
+            // is the safe direction for a rate limiter.
+            tracing::error!(
+                error = %e,
+                "system clock is before the unix epoch; rate-limit window fails closed"
+            );
+            0
+        }
+    }
 }
 
 impl RateLimiter {
