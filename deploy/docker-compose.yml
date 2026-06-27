@@ -35,6 +35,16 @@ services:
       SIGNET_RL_PARTICIPANT_MAX: "5"
       SIGNET_RL_GLOBAL_MAX: "1000"
       SIGNET_RL_WINDOW_SECS: "60"
+      # Client-identity pinning (audit M1/M3). SIGNET_CLIENT_CA must be a
+      # dedicated Signet-only client CA: any cert it signs can connect, and only
+      # identities listed here may call the endpoints. The dev certs use CN
+      # "freedink" (client) and "signet-admin" (admin); /key/rotate is admin-only.
+      SIGNET_ALLOWED_CLIENT_IDS: "freedink,signet-admin"
+      SIGNET_ADMIN_IDS: "signet-admin"
+      # Async keygen worker-pool + /key* rate limits (audit H1).
+      SIGNET_KEYGEN_MAX_CONCURRENT: "2"
+      SIGNET_RL_KEY_IDENTITY_MAX: "10"
+      SIGNET_RL_KEY_GLOBAL_MAX: "100"
       RUST_LOG: "info"
     volumes:
       # Persistent encrypted-at-rest key DB.

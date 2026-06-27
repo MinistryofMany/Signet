@@ -19,6 +19,7 @@ echo
 echo "Generated in $OUT:"
 echo "  ca.pem / ca.key          CA (server trusts client certs signed by this)"
 echo "  server.pem / server.key  Signet server cert (SANs: signet, localhost, 127.0.0.1)"
-echo "  client.pem / client.key  FreedInk client cert (mount into FreedInk)"
+echo "  client.pem / client.key  FreedInk client cert, CN 'freedink' (mount into FreedInk)"
+echo "  admin.pem  / admin.key    admin client cert, CN 'signet-admin' (for /key/rotate)"
 echo
 echo "These are DEV certs. For production use your real PKI and keep ca.key offline."

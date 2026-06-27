@@ -1,9 +1,14 @@
 //! Dev mTLS certificate generator (pure Rust, no openssl needed).
 //!
-//! Produces a self-signed CA and two leaf certs into an output directory:
-//!   ca.pem / ca.key            - the CA (signs both leaves; trusted by both ends)
+//! Produces a self-signed CA and leaf certs into an output directory:
+//!   ca.pem / ca.key            - the CA (signs all leaves; trusted by both ends)
 //!   server.pem / server.key    - Signet's server cert (SAN below; ServerAuth)
-//!   client.pem / client.key    - FreedInk's client cert (ClientAuth)
+//!   client.pem / client.key    - FreedInk's client cert (CN "freedink"; ClientAuth)
+//!   admin.pem  / admin.key      - admin client cert (CN "signet-admin"; ClientAuth)
+//!
+//! The client/admin CNs match the SIGNET_ALLOWED_CLIENT_IDS / SIGNET_ADMIN_IDS
+//! defaults shown in deploy/docker-compose.yml, so /key/rotate is reachable with
+//! the admin cert and refused with the plain client cert.
 //!
 //! Usage:
 //!   cargo run --release --example gen_certs -- <out_dir> [server_san ...]
@@ -74,21 +79,28 @@ fn main() {
     write(out, "server.pem", &server_cert.pem());
     write(out, "server.key", &server_key.serialize_pem());
 
-    // --- Client cert (FreedInk) ---
-    let client_key = KeyPair::generate().expect("client key");
-    let mut client_params = CertificateParams::new(vec![]).expect("client params");
-    client_params
-        .distinguished_name
-        .push(DnType::CommonName, "freedink");
-    client_params.is_ca = IsCa::NoCa;
-    client_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
-    let client_cert = client_params
-        .signed_by(&client_key, &ca_cert, &ca_key)
-        .expect("sign client");
-    write(out, "client.pem", &client_cert.pem());
-    write(out, "client.key", &client_key.serialize_pem());
+    // --- Client certs (FreedInk + admin) ---
+    let mint_client = |cn: &str, cert_name: &str, key_name: &str| {
+        let key = KeyPair::generate().expect("client key");
+        let mut params = CertificateParams::new(vec![]).expect("client params");
+        params.distinguished_name.push(DnType::CommonName, cn);
+        params.is_ca = IsCa::NoCa;
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        let cert = params
+            .signed_by(&key, &ca_cert, &ca_key)
+            .expect("sign client");
+        write(out, cert_name, &cert.pem());
+        write(out, key_name, &key.serialize_pem());
+    };
+    // CN "freedink" matches SIGNET_ALLOWED_CLIENT_IDS; the signing client cert.
+    mint_client("freedink", "client.pem", "client.key");
+    // CN "signet-admin" matches SIGNET_ADMIN_IDS; required for /key/rotate.
+    mint_client("signet-admin", "admin.pem", "admin.key");
 
-    eprintln!("wrote CA + server + client certs to {}", out.display());
+    eprintln!(
+        "wrote CA + server + client + admin certs to {}",
+        out.display()
+    );
     eprintln!(
         "server SANs: signet, localhost, 127.0.0.1{}",
         if extra_sans.is_empty() {

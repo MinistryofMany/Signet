@@ -22,14 +22,14 @@ token (unblinded nonce + signature) back to a participant. The audit log records
 only the identity tuple plus a timestamp — never the `blinded_message` or the
 `blind_signature`.
 
-## Endpoints (all require mTLS)
+## Endpoints (all require mTLS + a pinned client identity)
 
 | Method | Path | Body / query | Returns |
 | ------ | ---- | ------------ | ------- |
-| `POST` | `/sign` | `{ group_id, participant_id, version_id, blinded_message }` (base64) | `{ blind_signature }` (base64) |
-| `GET`  | `/key` | `?group_id=…` | `{ group_id, public_key, key_id }` (SPKI, base64) |
-| `POST` | `/key` | `?group_id=…` | create the group key if absent (idempotent) |
-| `POST` | `/key/rotate` | `?group_id=…` | retire the active key, generate a fresh one |
+| `POST` | `/sign` | `{ group_id, participant_id, version_id, blinded_message }` (base64) | `{ blind_signature }` (base64); `202 { status:"pending" }` if the key is still being generated |
+| `GET`  | `/key` | `?group_id=…` | `200 { group_id, status:"ready", public_key, key_id }` (SPKI, base64) or `202 { group_id, status:"pending" }` |
+| `POST` | `/key` | `?group_id=…` | enqueue key generation; `202 { status:"pending" }` (or `200` ready if one already exists). Idempotent + deduped per group |
+| `POST` | `/key/rotate` | `?group_id=…` | **admin identity only**: retire the active key, generate a fresh one → `200 { status:"ready", … }` |
 | `GET`  | `/healthz` | — | `ok` |
 
 `/sign` enforces, in order: rate limits (per-participant + global) → **record-first
@@ -37,6 +37,19 @@ reservation** (insert the issuance row before signing; a `UNIQUE(group_id,
 participant_id, version_id)` index makes a concurrent double-issue lose the race)
 → blind-sign. If signing fails after reservation, the reservation is rolled back
 so a transient error does not burn the participant's single token.
+
+### Async key generation (no cold-keygen request stall)
+
+Safe-prime RSA keygen takes seconds, so key creation is **non-blocking**:
+`POST /key` (and the auto-create path of `GET /key`) enqueue generation on a
+bounded worker pool and return `202 pending` immediately; the caller **polls**
+`GET /key` until it returns `200 ready`. Concurrent requests for the same
+`group_id` are **deduped** to one generation, and a semaphore
+(`SIGNET_KEYGEN_MAX_CONCURRENT`) caps how many keygens run at once — so a flood of
+`/key` requests cannot spawn unbounded multi-second CPU work. `/sign` for a
+not-yet-ready key waits a short bounded time and then returns `202 pending`
+rather than holding a request thread for the full keygen. The `/key*` endpoints
+are rate-limited per client identity and globally.
 
 There is **no key-export endpoint**, ever. Private keys never leave the process
 except as AES-256-GCM ciphertext written to the local DB.
@@ -100,6 +113,11 @@ cargo test --release             # unit + integration tests (mTLS, invariants, a
 | `SIGNET_RL_PARTICIPANT_MAX` | no | `5` | Max issuances per participant per window. |
 | `SIGNET_RL_GLOBAL_MAX` | no | `1000` | Max issuances across all participants per window. |
 | `SIGNET_RL_WINDOW_SECS` | no | `60` | Rate-limit window length (seconds). |
+| `SIGNET_ALLOWED_CLIENT_IDS` | no | *(empty)* | Comma-separated client identities (cert CN or DNS SAN) allowed to call the signing/key endpoints. **Empty = any cert chaining to `SIGNET_CLIENT_CA` is accepted** (a warning is logged). Set this in production. |
+| `SIGNET_ADMIN_IDS` | no | *(empty)* | Comma-separated admin identities allowed to call `/key/rotate`. **Empty = rotation is disabled for everyone** (fail-closed). |
+| `SIGNET_KEYGEN_MAX_CONCURRENT` | no | `2` | Max concurrent key generations (bounded worker pool). |
+| `SIGNET_RL_KEY_IDENTITY_MAX` | no | `10` | Max `/key*` requests per client identity per window. |
+| `SIGNET_RL_KEY_GLOBAL_MAX` | no | `100` | Max `/key*` requests across all identities per window. |
 | `RUST_LOG` | no | `info` | Log filter. |
 
 Generate a KEK:
@@ -108,12 +126,36 @@ Generate a KEK:
 head -c32 /dev/urandom | base64        # or: head -c32 /dev/urandom | xxd -p -c64
 ```
 
-### mTLS setup
+### mTLS setup and client-identity pinning
 
 The server presents its own cert AND requires a client cert chaining to
 `SIGNET_CLIENT_CA`. A client with no cert, or a cert from an untrusted CA, is
-refused at the TLS handshake — before any HTTP runs. Only the holder of a valid
-client cert (FreedInk) can reach `/sign`.
+refused at the TLS handshake — before any HTTP runs.
+
+mTLS chain validation alone is **not** the access boundary: on top of it Signet
+pins the peer's **identity** (the leaf cert's CN or a DNS SAN) and classifies it
+into a role.
+
+- **`SIGNET_CLIENT_CA` must be a dedicated, Signet-only client CA.** Because any
+  certificate that chains to it can attempt to connect, this CA must sign *only*
+  Signet client certs (FreedInk's, and your admin cert) — never reuse a shared
+  org/web CA. Keep its key offline; mint client certs from it directly.
+- **`SIGNET_ALLOWED_CLIENT_IDS`** restricts which identities may call the
+  signing/key endpoints. A cert that chains to the CA but is not on this list is
+  dropped at the connection. Leaving it empty accepts any valid-chain cert (a
+  startup warning is logged); set it in production.
+- **`SIGNET_ADMIN_IDS`** gates `/key/rotate` behind a *distinct admin identity*
+  (a separate allowed CN, or an admin-only cert). A non-admin client gets `403`;
+  with no admin identity configured, rotation is disabled for everyone.
+
+**Rotation invalidates outstanding tokens.** `POST /key/rotate` retires the
+group's active key and mints a new one. Any vote token signed under the retired
+key will no longer verify against the now-current public key served by
+`GET /key`. Rotate only when you intend to invalidate previously issued tokens
+for that group (e.g. on suspected key compromise), and coordinate with FreedInk's
+verification/redemption window.
+
+Only the holder of an allow-listed client cert (FreedInk) can reach `/sign`.
 
 Generate dev certs (pure Rust, no openssl):
 
@@ -173,8 +215,18 @@ This pass builds the service only. To wire FreedInk in (separate branch):
   `(group_id, key_id)` bound as additional authenticated data; the DB never
   holds plaintext PKCS#8 (`tests/at_rest.rs` asserts this).
 - **mTLS** is mandatory; a certless client is rejected at the handshake
-  (`tests/mtls.rs`).
+  (`tests/mtls.rs`). On top of mTLS, the peer **identity** (cert CN/DNS SAN) is
+  pinned: an off-allow-list cert is dropped at the connection, and `/key/rotate`
+  requires a distinct admin identity (`tests/keygen_dos.rs`).
 - **One-per-tuple** holds under concurrency via record-first + a UNIQUE index
   (`tests/issuance.rs::concurrent_same_tuple_yields_exactly_one_success`).
-- The KEK lives only in process memory and is zeroized on drop; it is never
-  logged, returned, or written to the DB.
+- **Keygen is bounded**: key creation is async with a semaphore-capped worker
+  pool and per-group dedup, and the `/key*` endpoints are rate-limited, so a
+  flood cannot spawn unbounded multi-second keygens (`tests/keygen_dos.rs`).
+- The KEK lives only in process memory and is zeroized on drop; the raw encoded
+  value is also zeroized and removed from the process environment after load. It
+  is never logged, returned, or written to the DB.
+- **Supply chain**: `deny.toml` + CI run `cargo deny check` (advisories,
+  licenses, banned crates, sources). Two advisories are consciously accepted with
+  documented reasons (the `rsa` Marvin-attack timing advisory, for which no fixed
+  release exists, and the unmaintained `rustls-pemfile`); see `deny.toml`.
