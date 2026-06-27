@@ -238,11 +238,7 @@ impl Db {
     }
 
     /// Count issuances for a participant since `since` (unix secs).
-    pub fn count_participant_since(
-        &self,
-        participant_id: &str,
-        since: i64,
-    ) -> Result<u32, String> {
+    pub fn count_participant_since(&self, participant_id: &str, since: i64) -> Result<u32, String> {
         let conn = self.lock_conn();
         conn.query_row(
             "SELECT COUNT(*) FROM issuances WHERE participant_id = ?1 AND issued_at >= ?2",
@@ -327,12 +323,7 @@ pub fn create_key(
 }
 
 /// Rotate a group's key, persisting the new one encrypted at rest.
-pub fn rotate_key(
-    db: &Db,
-    kek: &Kek,
-    group_id: &str,
-    bits: usize,
-) -> Result<Vec<u8>, String> {
+pub fn rotate_key(db: &Db, kek: &Kek, group_id: &str, bits: usize) -> Result<Vec<u8>, String> {
     let generated = crate::crypto::generate_group_key(bits)?;
     let placeholder = kek.seal(group_id, 0, &generated.pkcs8_der)?;
     let key_id = db.rotate_key(group_id, &generated.spki_der, &placeholder)?;

@@ -24,16 +24,27 @@ fn info(version: &str) -> Vec<u8> {
     signet::crypto::version_info(version)
 }
 
+/// Fetch the active public key, polling `GET /key` until the async keygen
+/// reports the key ready. The first call typically returns 202 pending.
 async fn fetch_pubkey(client: &reqwest::Client, base: &str, group: &str) -> PubKey {
-    let res = client
-        .get(format!("{base}/key?group_id={group}"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), 200);
-    let body: serde_json::Value = res.json().await.unwrap();
-    let spki = B64.decode(body["public_key"].as_str().unwrap()).unwrap();
-    signet::crypto::public_key_from_spki(&spki).unwrap()
+    for _ in 0..1200 {
+        let res = client
+            .get(format!("{base}/key?group_id={group}"))
+            .send()
+            .await
+            .unwrap();
+        let status = res.status();
+        let body: serde_json::Value = res.json().await.unwrap();
+        if status == 200 {
+            assert_eq!(body["status"], "ready");
+            let spki = B64.decode(body["public_key"].as_str().unwrap()).unwrap();
+            return signet::crypto::public_key_from_spki(&spki).unwrap();
+        }
+        assert_eq!(status, 202, "expected ready(200) or pending(202): {body}");
+        assert_eq!(body["status"], "pending");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("key for {group} never became ready");
 }
 
 /// Run a full issuance: blind a nonce client-side, POST /sign, return the
@@ -50,7 +61,11 @@ async fn request_sign(
     group: &str,
     participant: &str,
     version: &str,
-) -> (reqwest::StatusCode, serde_json::Value, Option<FinalizeState>) {
+) -> (
+    reqwest::StatusCode,
+    serde_json::Value,
+    Option<FinalizeState>,
+) {
     let info = info(version);
     let derived_pk = pk.derive_public_key_for_metadata(&info).unwrap();
     let nonce = b"token-nonce-0123456789abcdef0123";
@@ -124,7 +139,9 @@ async fn signed_token_verifies_and_cross_version_fails() {
     assert_eq!(status, 200, "{body}");
     let state = state.unwrap();
 
-    let blind_sig = B64.decode(body["blind_signature"].as_str().unwrap()).unwrap();
+    let blind_sig = B64
+        .decode(body["blind_signature"].as_str().unwrap())
+        .unwrap();
     let blind_sig = BlindSignature(blind_sig);
 
     // Finalize + verify under v1 (against the v1-derived public key): success.
@@ -135,7 +152,12 @@ async fn signed_token_verifies_and_cross_version_fails() {
         .expect("v1 token must finalize");
     state
         .derived_pk
-        .verify(&sig, state.blinding.msg_randomizer, &state.nonce, Some(&info_v1))
+        .verify(
+            &sig,
+            state.blinding.msg_randomizer,
+            &state.nonce,
+            Some(&info_v1),
+        )
         .expect("v1 token must verify under v1");
 
     // The same signature must NOT verify under v2 metadata (cross-version
@@ -144,7 +166,12 @@ async fn signed_token_verifies_and_cross_version_fails() {
     let derived_v2 = pk.derive_public_key_for_metadata(&info_v2).unwrap();
     assert!(
         derived_v2
-            .verify(&sig, state.blinding.msg_randomizer, &state.nonce, Some(&info_v2))
+            .verify(
+                &sig,
+                state.blinding.msg_randomizer,
+                &state.nonce,
+                Some(&info_v2)
+            )
             .is_err(),
         "v1 token must not verify under v2 metadata"
     );
@@ -159,6 +186,7 @@ async fn participant_rate_limit_fires() {
             rl_participant_max: 2,
             rl_global_max: 10_000,
             key_bits: 2048,
+            ..ServerOpts::default()
         },
     )
     .await;
@@ -186,6 +214,7 @@ async fn global_rate_limit_fires() {
             rl_participant_max: 1000,
             rl_global_max: 2,
             key_bits: 2048,
+            ..ServerOpts::default()
         },
     )
     .await;

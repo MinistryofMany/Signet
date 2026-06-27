@@ -41,15 +41,26 @@ async fn get_key_returns_spki() {
     let pki = make_pki();
     let server = start_server(&pki, ServerOpts::default()).await;
     let client = client_with_cert(&pki);
+    let url = format!("{}/key?group_id=blog-1", base_url(&server));
 
-    let res = client
-        .get(format!("{}/key?group_id=blog-1", base_url(&server)))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), 200);
-    let body: serde_json::Value = res.json().await.unwrap();
-    assert_eq!(body["group_id"], "blog-1");
+    // Async keygen: the first GET enqueues and returns 202 pending; poll until
+    // the key is ready, then assert the SPKI parses.
+    let mut ready_body = None;
+    for _ in 0..1200 {
+        let res = client.get(&url).send().await.unwrap();
+        let status = res.status();
+        let body: serde_json::Value = res.json().await.unwrap();
+        assert_eq!(body["group_id"], "blog-1");
+        if status == 200 {
+            assert_eq!(body["status"], "ready");
+            ready_body = Some(body);
+            break;
+        }
+        assert_eq!(status, 202, "expected ready or pending: {body}");
+        assert_eq!(body["status"], "pending");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let body = ready_body.expect("key never became ready");
     let spki_b64 = body["public_key"].as_str().unwrap();
     let spki = base64::Engine::decode(
         &base64::engine::general_purpose::STANDARD,

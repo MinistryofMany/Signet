@@ -34,6 +34,32 @@ pub struct Config {
     pub rl_window_secs: u64,
     /// Modulus size in bits for newly generated group keys.
     pub key_bits: usize,
+    /// Allow-list of client identities (cert CN or DNS SAN) permitted to call
+    /// the signing/key endpoints. Empty = any valid-chain cert (back-compat,
+    /// warned at startup). Audit M1/M3.
+    pub allowed_client_ids: std::collections::BTreeSet<String>,
+    /// Allow-list of admin identities permitted to call `/key/rotate`. Empty =
+    /// rotation disabled for everyone (fail-closed). Audit M1/M3.
+    pub admin_ids: std::collections::BTreeSet<String>,
+    /// Maximum concurrent key generations (bounded worker pool). Audit H1.
+    pub keygen_max_concurrent: usize,
+    /// Per-identity rate limit for `/key*` endpoints, per window. Audit H1.
+    pub rl_key_identity_max: u32,
+    /// Global rate limit for `/key*` endpoints, per window. Audit H1.
+    pub rl_key_global_max: u32,
+}
+
+/// Parse a comma-separated env var into a set of trimmed, non-empty identities.
+fn env_id_set(key: &str) -> std::collections::BTreeSet<String> {
+    match std::env::var(key) {
+        Ok(v) => v
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect(),
+        Err(_) => std::collections::BTreeSet::new(),
+    }
 }
 
 fn env_required(key: &str) -> Result<String, String> {
@@ -81,6 +107,11 @@ impl Config {
             ));
         }
 
+        let keygen_max_concurrent: usize = env_or("SIGNET_KEYGEN_MAX_CONCURRENT", 2usize)?;
+        if keygen_max_concurrent == 0 {
+            return Err("SIGNET_KEYGEN_MAX_CONCURRENT must be >= 1".to_string());
+        }
+
         Ok(Config {
             bind,
             db_path,
@@ -93,6 +124,11 @@ impl Config {
             rl_global_max: env_or("SIGNET_RL_GLOBAL_MAX", 1000u32)?,
             rl_window_secs: env_or("SIGNET_RL_WINDOW_SECS", 60u64)?,
             key_bits,
+            allowed_client_ids: env_id_set("SIGNET_ALLOWED_CLIENT_IDS"),
+            admin_ids: env_id_set("SIGNET_ADMIN_IDS"),
+            keygen_max_concurrent,
+            rl_key_identity_max: env_or("SIGNET_RL_KEY_IDENTITY_MAX", 10u32)?,
+            rl_key_global_max: env_or("SIGNET_RL_KEY_GLOBAL_MAX", 100u32)?,
         })
     }
 }

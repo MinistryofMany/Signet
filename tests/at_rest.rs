@@ -24,14 +24,38 @@ async fn private_key_is_ciphertext_at_rest() {
     let client = client_with_cert(&pki);
     let base = base_url(&server);
 
-    // Create a couple of group keys so the DB has key rows to inspect.
+    // Create a couple of group keys so the DB has key rows to inspect. Key
+    // creation is now async: POST enqueues (202 pending), so poll GET until the
+    // key is ready before opening the DB.
     for g in ["blog-a", "blog-b"] {
         let res = client
             .post(format!("{base}/key?group_id={g}"))
             .send()
             .await
             .unwrap();
-        assert_eq!(res.status(), 200);
+        assert!(
+            res.status() == 202 || res.status() == 200,
+            "POST /key should enqueue (202) or be already-ready (200)"
+        );
+        // Poll until ready (generous ceiling for slow release keygen).
+        let mut ready = false;
+        for _ in 0..1200 {
+            let res = client
+                .get(format!("{base}/key?group_id={g}"))
+                .send()
+                .await
+                .unwrap();
+            let status = res.status();
+            let body: serde_json::Value = res.json().await.unwrap();
+            if status == 200 {
+                assert_eq!(body["status"], "ready");
+                ready = true;
+                break;
+            }
+            assert_eq!(status, 202, "expected ready or pending: {body}");
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(ready, "key for {g} never became ready");
     }
 
     // Open the SQLite file directly and inspect the stored private-key blobs.
@@ -54,7 +78,10 @@ async fn private_key_is_ciphertext_at_rest() {
             blob[0], 0x01,
             "blob for {group} must be our sealed envelope (v1), not raw DER"
         );
-        assert_ne!(blob[0], 0x30, "blob for {group} starts with a DER SEQUENCE tag");
+        assert_ne!(
+            blob[0], 0x30,
+            "blob for {group} starts with a DER SEQUENCE tag"
+        );
         // No plaintext PKCS#8 structural markers may appear anywhere in the blob.
         assert!(
             !contains(blob, RSA_OID),

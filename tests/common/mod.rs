@@ -12,9 +12,12 @@ use rcgen::{
     KeyUsagePurpose, SanType,
 };
 use signet::db::Db;
+use signet::identity::IdentityPolicy;
+use signet::keygen::KeygenService;
 use signet::keystore::Kek;
-use signet::ratelimit::RateLimiter;
+use signet::ratelimit::{KeyRateLimiter, RateLimiter};
 use signet::state::AppState;
+use std::collections::BTreeSet;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::Once;
@@ -31,14 +34,30 @@ pub struct Pki {
     pub ca_pem: String,
     pub server_cert_pem: String,
     pub server_key_pem: String,
+    /// Default client identity: CN "freedink".
     pub client_cert_pem: String,
     pub client_key_pem: String,
+    /// Admin client identity: CN "signet-admin".
+    pub admin_cert_pem: String,
+    pub admin_key_pem: String,
+    /// A second non-admin client identity: CN "intruder" (used to prove a cert
+    /// that chains to the CA but is off the allow-list is rejected).
+    pub other_cert_pem: String,
+    pub other_key_pem: String,
 }
+
+/// CN of the default client cert.
+pub const CLIENT_CN: &str = "freedink";
+/// CN of the admin client cert.
+pub const ADMIN_CN: &str = "signet-admin";
+/// CN of the second, non-allow-listed client cert.
+pub const OTHER_CN: &str = "intruder";
 
 pub fn make_pki() -> Pki {
     let ca_key = KeyPair::generate().unwrap();
     let mut ca = CertificateParams::new(vec![]).unwrap();
-    ca.distinguished_name.push(DnType::CommonName, "Signet Test CA");
+    ca.distinguished_name
+        .push(DnType::CommonName, "Signet Test CA");
     ca.is_ca = IsCa::Ca(BasicConstraints::Constrained(1));
     ca.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
     let ca_cert = ca.self_signed(&ca_key).unwrap();
@@ -53,18 +72,29 @@ pub fn make_pki() -> Pki {
     sp.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
     let server_cert = sp.signed_by(&server_key, &ca_cert, &ca_key).unwrap();
 
-    let client_key = KeyPair::generate().unwrap();
-    let mut cp = CertificateParams::new(vec![]).unwrap();
-    cp.distinguished_name.push(DnType::CommonName, "freedink");
-    cp.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
-    let client_cert = cp.signed_by(&client_key, &ca_cert, &ca_key).unwrap();
+    let mint_client = |cn: &str| {
+        let key = KeyPair::generate().unwrap();
+        let mut cp = CertificateParams::new(vec![]).unwrap();
+        cp.distinguished_name.push(DnType::CommonName, cn);
+        cp.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        let cert = cp.signed_by(&key, &ca_cert, &ca_key).unwrap();
+        (cert.pem(), key.serialize_pem())
+    };
+
+    let (client_cert_pem, client_key_pem) = mint_client(CLIENT_CN);
+    let (admin_cert_pem, admin_key_pem) = mint_client(ADMIN_CN);
+    let (other_cert_pem, other_key_pem) = mint_client(OTHER_CN);
 
     Pki {
         ca_pem: ca_cert.pem(),
         server_cert_pem: server_cert.pem(),
         server_key_pem: server_key.serialize_pem(),
-        client_cert_pem: client_cert.pem(),
-        client_key_pem: client_key.serialize_pem(),
+        client_cert_pem,
+        client_key_pem,
+        admin_cert_pem,
+        admin_key_pem,
+        other_cert_pem,
+        other_key_pem,
     }
 }
 
@@ -86,6 +116,17 @@ pub struct ServerOpts {
     pub rl_participant_max: u32,
     pub rl_global_max: u32,
     pub key_bits: usize,
+    /// `/key*` per-identity ceiling.
+    pub rl_key_identity_max: u32,
+    /// `/key*` global ceiling.
+    pub rl_key_global_max: u32,
+    /// Concurrent keygen cap.
+    pub keygen_max_concurrent: usize,
+    /// Allowed client identities (empty = open client list).
+    pub allowed_client_ids: BTreeSet<String>,
+    /// Admin identities (empty = rotation disabled).
+    pub admin_ids: BTreeSet<String>,
+    pub auto_create_keys: bool,
 }
 
 impl Default for ServerOpts {
@@ -96,8 +137,22 @@ impl Default for ServerOpts {
             rl_participant_max: 100,
             rl_global_max: 10_000,
             key_bits: 2048,
+            // Effectively unlimited by default: many tests poll GET /key in a
+            // tight loop while a slow keygen runs, which must not trip the rate
+            // limiter. Tests that assert the limiter fires set low caps.
+            rl_key_identity_max: 1_000_000,
+            rl_key_global_max: 1_000_000,
+            keygen_max_concurrent: 2,
+            allowed_client_ids: BTreeSet::new(),
+            admin_ids: BTreeSet::new(),
+            auto_create_keys: true,
         }
     }
+}
+
+/// Convenience: build a set of identity strings.
+pub fn id_set(ids: &[&str]) -> BTreeSet<String> {
+    ids.iter().map(|s| s.to_string()).collect()
 }
 
 /// Start the real mTLS server on an ephemeral port. Returns once the listener
@@ -116,29 +171,35 @@ pub async fn start_server(pki: &Pki, opts: ServerOpts) -> Server {
     std::fs::write(&key_path, &pki.server_key_pem).unwrap();
 
     let kek = Kek::from_encoded(&hex::encode([0x5au8; 32])).unwrap();
-    let db = Db::open(&db_path).unwrap();
+    let db = Arc::new(Db::open(&db_path).unwrap());
+    let keygen = KeygenService::new(
+        db.clone(),
+        kek.clone(),
+        opts.key_bits,
+        opts.keygen_max_concurrent,
+    );
     let state = Arc::new(AppState {
         db,
         kek,
         rate_limiter: RateLimiter::new(opts.rl_participant_max, opts.rl_global_max, 60),
-        auto_create_keys: true,
+        key_rate_limiter: KeyRateLimiter::new(opts.rl_key_identity_max, opts.rl_key_global_max, 60),
+        keygen,
+        auto_create_keys: opts.auto_create_keys,
         key_bits: opts.key_bits,
     });
     let app = signet::router(state);
 
     let tls = signet::tls::build_server_config(&cert_path, &key_path, &ca_path).unwrap();
-    let rustls_config = axum_server::tls_rustls::RustlsConfig::from_config(tls);
+    let policy = IdentityPolicy::new(opts.allowed_client_ids.clone(), opts.admin_ids.clone());
 
-    // Bind an ephemeral port via std, learn the addr, then hand to axum-server.
+    // Bind an ephemeral port via std, learn the addr, then hand to the shared
+    // identity-pinning serve path.
     let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     listener.set_nonblocking(true).unwrap();
     let addr = listener.local_addr().unwrap();
 
     let handle = tokio::spawn(async move {
-        axum_server::from_tcp_rustls(listener, rustls_config)
-            .serve(app.into_make_service())
-            .await
-            .unwrap();
+        signet::serve(listener, tls, policy, app).await.unwrap();
     });
 
     // Wait for the port to accept TLS handshakes.
@@ -157,10 +218,10 @@ pub async fn start_server(pki: &Pki, opts: ServerOpts) -> Server {
     }
 }
 
-/// A reqwest client that presents the client certificate (authorized).
-pub fn client_with_cert(pki: &Pki) -> reqwest::Client {
-    let mut identity_pem = pki.client_cert_pem.clone();
-    identity_pem.push_str(&pki.client_key_pem);
+/// Build a reqwest client presenting the given cert+key PEM as its identity.
+fn client_with_identity(pki: &Pki, cert_pem: &str, key_pem: &str) -> reqwest::Client {
+    let mut identity_pem = cert_pem.to_string();
+    identity_pem.push_str(key_pem);
     let identity = reqwest::Identity::from_pem(identity_pem.as_bytes()).unwrap();
     let ca = reqwest::Certificate::from_pem(pki.ca_pem.as_bytes()).unwrap();
     reqwest::Client::builder()
@@ -169,6 +230,22 @@ pub fn client_with_cert(pki: &Pki) -> reqwest::Client {
         .identity(identity)
         .build()
         .unwrap()
+}
+
+/// A reqwest client that presents the default client certificate (CN freedink).
+pub fn client_with_cert(pki: &Pki) -> reqwest::Client {
+    client_with_identity(pki, &pki.client_cert_pem, &pki.client_key_pem)
+}
+
+/// A reqwest client presenting the admin certificate (CN signet-admin).
+pub fn admin_client(pki: &Pki) -> reqwest::Client {
+    client_with_identity(pki, &pki.admin_cert_pem, &pki.admin_key_pem)
+}
+
+/// A reqwest client presenting the second non-admin cert (CN intruder); chains
+/// to the CA but is not on a configured allow-list.
+pub fn other_client(pki: &Pki) -> reqwest::Client {
+    client_with_identity(pki, &pki.other_cert_pem, &pki.other_key_pem)
 }
 
 /// A reqwest client with NO client certificate (should be rejected by mTLS).

@@ -2,7 +2,10 @@
 name = "signet"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+# 1.87: usize::is_multiple_of (used in config.rs key-bits validation) was
+# stabilized in 1.87. The codebase already relies on it, so this is the true
+# minimum supported version.
+rust-version = "1.87"
 description = "Hardened partially-blind RSA signing service for FreedInk vote tokens"
 license = "MIT"
 publish = false
@@ -26,6 +29,10 @@ axum-server = { version = "0.7", features = ["tls-rustls"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 tower = { version = "0.5", features = ["limit"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
+# Used by the custom identity-pinning Accept layer to terminate TLS and read the
+# verified peer leaf. default-features=false matches axum-server: the ring crypto
+# provider is installed explicitly in main.rs.
+tokio-rustls = { version = "0.26", default-features = false }
 rustls-pemfile = "2"
 x509-parser = "0.18"
 

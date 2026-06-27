@@ -20,6 +20,12 @@ pub enum AppError {
     RateLimited,
     /// Group key does not exist and auto-create is disabled.
     NoSuchKey,
+    /// The group key is still being generated; the caller should retry shortly.
+    /// Maps to HTTP 202 Accepted with `{ "status": "pending" }`.
+    KeyPending,
+    /// The caller's pinned client identity is not authorized for this endpoint
+    /// (e.g. a non-admin calling `/key/rotate`). Maps to HTTP 403.
+    Forbidden(&'static str),
     /// Internal failure (DB, crypto, encoding). Never includes detail in body.
     Internal(String),
 }
@@ -31,6 +37,8 @@ impl std::fmt::Display for AppError {
             AppError::AlreadyIssued => write!(f, "already issued"),
             AppError::RateLimited => write!(f, "rate limited"),
             AppError::NoSuchKey => write!(f, "no such key"),
+            AppError::KeyPending => write!(f, "key pending"),
+            AppError::Forbidden(m) => write!(f, "forbidden: {m}"),
             AppError::Internal(m) => write!(f, "internal error: {m}"),
         }
     }
@@ -45,21 +53,33 @@ impl IntoResponse for AppError {
             AppError::AlreadyIssued => (StatusCode::CONFLICT, "already_issued"),
             AppError::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
             AppError::NoSuchKey => (StatusCode::NOT_FOUND, "no_such_key"),
+            AppError::KeyPending => (StatusCode::ACCEPTED, "pending"),
+            AppError::Forbidden(_) => (StatusCode::FORBIDDEN, "forbidden"),
             AppError::Internal(detail) => {
                 // Log detail; never return it to the caller.
                 tracing::error!(error = %detail, "internal error");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
             }
         };
-        // BadRequest carries a short static reason that is safe to surface.
+        // BadRequest / Forbidden carry a short static reason that is safe to
+        // surface.
         let message = match &self {
             AppError::BadRequest(m) => *m,
             AppError::AlreadyIssued => "a signature was already issued for this participation",
             AppError::RateLimited => "rate limit exceeded",
             AppError::NoSuchKey => "no key for this group",
+            AppError::KeyPending => "key is being generated; retry shortly",
+            AppError::Forbidden(m) => *m,
             AppError::Internal(_) => "internal error",
         };
-        (status, Json(json!({ "error": code, "message": message }))).into_response()
+        // The pending status uses `status` rather than `error` so clients can
+        // distinguish "retry, this is expected" from a real failure.
+        let body = if matches!(self, AppError::KeyPending) {
+            json!({ "status": "pending", "message": message })
+        } else {
+            json!({ "error": code, "message": message })
+        };
+        (status, Json(body)).into_response()
     }
 }
 
