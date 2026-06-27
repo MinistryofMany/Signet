@@ -1,0 +1,79 @@
+# cargo-deny configuration (audit L4).
+#
+# Run: `cargo deny check` (advisories + bans + licenses + sources).
+# CI runs this on every push/PR (see .github/workflows/audit.yml).
+#
+# Tooling note: tested with cargo-deny 0.19.x. The pinned schema below matches
+# that line; older/newer cargo-deny may warn about unknown keys.
+
+[graph]
+# Check the host target plus the Linux deployment target (Docker image).
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+]
+all-features = true
+
+[advisories]
+# RustSec advisories that we have reviewed and consciously accept. Every entry
+# carries a reason; an un-reasoned ignore is a red flag in review.
+ignore = [
+    # Marvin Attack (RSA timing sidechannel). There is NO fixed version of the
+    # `rsa` crate (or any pure-Rust RSA implementation), and it is pulled in
+    # transitively by `blind-rsa-signatures`, which is the vetted partially-blind
+    # RSA implementation this service is built on. Accepted residual risk, on
+    # these grounds, and NOT dismissed as a non-issue:
+    #   - Signet is internal-only: it sits on an `internal: true` Docker network
+    #     with no host port, reachable solely by FreedInk over mTLS (one trusted
+    #     client identity, pinned per `identity.rs`).
+    #   - The hot-path operation is a raw blind-signature modexp on a
+    #     caller-supplied blinded integer, not RSA decryption behind a padding
+    #     oracle; there is no decryption-of-attacker-ciphertext surface.
+    #   - There is no safe upgrade to remove the advisory; the alternative is to
+    #     not use Rust RSA at all, which is infeasible for this service.
+    # Revisit when RustCrypto/RSA ships a constant-time release.
+    { id = "RUSTSEC-2023-0071", reason = "no fixed rsa release exists; internal-only mTLS service, blind-sign modexp (not a decryption oracle); residual timing risk accepted" },
+
+    # rustls-pemfile is unmaintained (archived upstream). It is a thin wrapper
+    # over rustls-pki-types' PEM parsing and has no known security defect. It is
+    # pulled in both directly (cert/key loading in tls.rs) and by axum-server.
+    # Migrating to rustls-pki-types' PemObject API is a tracked cleanup, not a
+    # security fix.
+    { id = "RUSTSEC-2025-0134", reason = "unmaintained, not a vulnerability; thin wrapper over rustls-pki-types; migration is a separate cleanup" },
+]
+
+[licenses]
+# Permissive licenses only. Every license actually present in the dependency
+# tree resolves to one of these (compound `OR` expressions are satisfied by the
+# permissive arm; e.g. r-efi's `MIT OR Apache-2.0 OR LGPL-2.1-or-later` is taken
+# as MIT/Apache, incurring no copyleft obligation).
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Flag duplicate crate versions as a warning (informational; common in large
+# trees) and ban wildcard version requirements.
+#
+# NOTE: we deliberately do NOT use `[bans].allow` — in cargo-deny it switches to
+# an exclusive allow-list that rejects every crate not listed. The conscious use
+# of the `rsa` 0.10.0-rc.18 RC (required by blind-rsa-signatures 0.17.2) is
+# documented in the `[advisories].ignore` note above; nothing here bans it.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+# Only crates.io is allowed; no git or unknown-registry sources.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
