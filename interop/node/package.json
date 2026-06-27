@@ -1,0 +1,10 @@
+{
+  "name": "signet-interop",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Cross-language interop check: verify Signet (Rust) blind signatures with the same @cloudflare/blindrsa-ts FreedInk uses.",
+  "dependencies": {
+    "@cloudflare/blindrsa-ts": "0.4.6"
+  }
+}
