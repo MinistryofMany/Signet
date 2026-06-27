@@ -1,0 +1,17 @@
+# Rust build output
+/target
+
+# Secrets and runtime data — NEVER commit
+.env
+*.db
+*.db-wal
+*.db-shm
+
+# mTLS material — generated locally, never committed
+/deploy/certs/
+*.pem
+*.key
+
+# Node interop deps (installed on demand by interop/run.sh)
+/interop/node/node_modules
+/interop/node/package-lock.json

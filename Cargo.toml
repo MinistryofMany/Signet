@@ -1,0 +1,61 @@
+[package]
+name = "signet"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Hardened partially-blind RSA signing service for FreedInk vote tokens"
+license = "MIT"
+publish = false
+
+[lib]
+name = "signet"
+path = "src/lib.rs"
+
+[[bin]]
+name = "signet"
+path = "src/main.rs"
+
+[dependencies]
+# Crypto: partially-blind RSA with public metadata (RFC 9474 + draft-amjad-cfrg-partially-blind-rsa).
+# Interop-proven against @cloudflare/blindrsa-ts RSAPBSSA.SHA384.PSS.Randomized.
+blind-rsa-signatures = "=0.17.2"
+
+# HTTP + TLS
+axum = { version = "0.8", default-features = false, features = ["json", "tokio", "http1", "query"] }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+tower = { version = "0.5", features = ["limit"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
+rustls-pemfile = "2"
+x509-parser = "0.18"
+
+# Storage
+rusqlite = { version = "0.37", features = ["bundled"] }
+
+# Key-at-rest encryption
+aes-gcm = "0.10"
+zeroize = { version = "1", features = ["derive"] }
+
+# Encoding / serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+hex = "0.4"
+
+# Randomness for the data-encryption key nonces
+rand = "0.9"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-manual-roots"] }
+tempfile = "3"
+rcgen = "0.13"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
