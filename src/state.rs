@@ -19,4 +19,7 @@ pub struct AppState {
     pub keygen: KeygenService,
     pub auto_create_keys: bool,
     pub key_bits: usize,
+    /// Public-metadata namespace prefix bound into every signature as
+    /// `<info_prefix>:<version_id>` (config `SIGNET_INFO_PREFIX`).
+    pub info_prefix: String,
 }

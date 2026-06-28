@@ -226,7 +226,7 @@ fn sign_blocking(
             }
         })?;
 
-        let sig = crate::crypto::blind_sign(&pkcs8, &req.version_id, &blinded)
+        let sig = crate::crypto::blind_sign(&pkcs8, &state.info_prefix, &req.version_id, &blinded)
             .map_err(|e| AppError::Internal(format!("blind_sign failed: {e}")))?;
         Ok(sig)
     })();

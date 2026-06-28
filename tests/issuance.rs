@@ -20,8 +20,10 @@ use std::sync::Arc;
 
 type PubKey = PartiallyBlindPublicKey<Sha384, PSS, Randomized>;
 
+/// Metadata bytes under the default (FreedInk) prefix the default test server
+/// runs with. The custom-prefix test below builds its own metadata.
 fn info(version: &str) -> Vec<u8> {
-    signet::crypto::version_info(version)
+    signet::crypto::version_info("freedink-vote", version)
 }
 
 /// Fetch the active public key, polling `GET /key` until the async keygen
@@ -284,4 +286,71 @@ async fn concurrent_same_tuple_yields_exactly_one_success() {
     assert_eq!(ok, 1, "exactly one signature may be issued, got {ok}");
     assert_eq!(conflict, n - 1, "the rest must be 409, got {conflict}");
     assert_eq!(other, 0, "no other status allowed, got {other}");
+}
+
+#[tokio::test]
+async fn custom_info_prefix_threaded_end_to_end() {
+    // Boot a server configured with a NON-default prefix (Deforum's). Prove the
+    // prefix is threaded all the way: config -> AppState -> handler -> crypto. A
+    // token issued here must finalize+verify under `deforum-ban:<v>` but NOT
+    // under the default `freedink-vote:<v>` (what FreedInk would use). This is
+    // the end-to-end guard for the SIGNET_INFO_PREFIX unblock: if the handler
+    // ignored the config and used the old hard-coded prefix, finalize below
+    // would fail (the client blinded under deforum-ban, the server would have
+    // signed under freedink-vote).
+    let pki = make_pki();
+    let server = start_server(
+        &pki,
+        ServerOpts {
+            info_prefix: "deforum-ban".to_string(),
+            ..ServerOpts::default()
+        },
+    )
+    .await;
+    let client = client_with_cert(&pki);
+    let base = base_url(&server);
+    let pk = fetch_pubkey(&client, &base, "g1").await;
+
+    // Client blinds under the SAME prefix the server is configured with.
+    let info_deforum = signet::crypto::version_info("deforum-ban", "r1");
+    let derived_pk = pk.derive_public_key_for_metadata(&info_deforum).unwrap();
+    let nonce = b"deforum-ban-nonce-0123456789abcd";
+    let blinding = derived_pk
+        .blind(&mut DefaultRng, nonce, Some(&info_deforum))
+        .unwrap();
+    let blinded_b64 = B64.encode(&blinding.blind_message.0);
+
+    let res = client
+        .post(format!("{base}/sign"))
+        .json(&json!({
+            "group_id": "g1",
+            "participant_id": "mod-1",
+            "version_id": "r1",
+            "blinded_message": blinded_b64,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "issuance under custom prefix must succeed");
+    let body: serde_json::Value = res.json().await.unwrap();
+    let blind_sig = BlindSignature(B64.decode(body["blind_signature"].as_str().unwrap()).unwrap());
+
+    // Finalize + verify under deforum-ban: must succeed.
+    let sig = derived_pk
+        .finalize(&blind_sig, &blinding, nonce, Some(&info_deforum))
+        .expect("deforum-ban token must finalize (handler used the configured prefix)");
+    derived_pk
+        .verify(&sig, blinding.msg_randomizer, nonce, Some(&info_deforum))
+        .expect("deforum-ban token must verify under deforum-ban");
+
+    // The same signature must NOT verify under the default freedink-vote prefix:
+    // proves the server bound deforum-ban, not the old hard-coded default.
+    let info_freedink = signet::crypto::version_info("freedink-vote", "r1");
+    let derived_freedink = pk.derive_public_key_for_metadata(&info_freedink).unwrap();
+    assert!(
+        derived_freedink
+            .verify(&sig, blinding.msg_randomizer, nonce, Some(&info_freedink))
+            .is_err(),
+        "a deforum-ban token must not verify under the freedink-vote prefix"
+    );
 }

@@ -4,7 +4,8 @@ This harness proves that signatures produced by Signet (Rust,
 `blind-rsa-signatures` crate, suite `RSAPBSSA-SHA384-PSS-Randomized`) interoperate
 with the exact TypeScript library FreedInk uses to verify vote tokens
 (`@cloudflare/blindrsa-ts`, `RSAPBSSA.SHA384.PSS.Randomized`), binding the public
-metadata `freedink-vote:<version_id>`.
+metadata `<prefix>:<version_id>` (prefix `freedink-vote` by default, configurable
+via `SIGNET_INFO_PREFIX`).
 
 It exercises the **production data path**:
 
@@ -17,8 +18,11 @@ It exercises the **production data path**:
 4. The TS client **finalizes and verifies** the signature (this is what
    FreedInk's redemption verifier does).
 
-It also checks **cross-version binding**: a signature issued under `post-v1`
-must fail to verify under `post-v2`.
+The full flow runs under the default `freedink-vote` prefix and again under a
+non-default `deforum-ban` prefix, proving `SIGNET_INFO_PREFIX` interops with the
+real library. It also checks **cross-version binding** (a signature issued under
+`post-v1` must fail to verify under `post-v2`) and **cross-prefix binding** (a
+`deforum-ban` token must fail to verify under `freedink-vote`).
 
 ## Run
 

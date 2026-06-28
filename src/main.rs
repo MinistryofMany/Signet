@@ -61,6 +61,7 @@ async fn run() -> Result<(), String> {
         keygen,
         auto_create_keys: cfg.auto_create_keys,
         key_bits: cfg.key_bits,
+        info_prefix: cfg.info_prefix.clone(),
     });
 
     let policy = IdentityPolicy::new(cfg.allowed_client_ids.clone(), cfg.admin_ids.clone());
@@ -86,6 +87,7 @@ async fn run() -> Result<(), String> {
         bind = %cfg.bind,
         db = %cfg.db_path.display(),
         key_bits = cfg.key_bits,
+        info_prefix = %cfg.info_prefix,
         auto_create_keys = cfg.auto_create_keys,
         rl_participant_max = cfg.rl_participant_max,
         rl_global_max = cfg.rl_global_max,

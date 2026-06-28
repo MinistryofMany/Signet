@@ -8,8 +8,9 @@ relying party cannot bypass to mass-forge tokens.
 
 It interoperates with FreedInk's existing verifier: suite
 `RSAPBSSA-SHA384-PSS-Randomized` (RFC 9474 + the public-metadata extension,
-`draft-amjad-cfrg-partially-blind-rsa`), public metadata
-`freedink-vote:<version_id>` — the exact scheme `@cloudflare/blindrsa-ts` uses.
+`draft-amjad-cfrg-partially-blind-rsa`), public metadata `<prefix>:<version_id>`
+(prefix `freedink-vote` by default, configurable via `SIGNET_INFO_PREFIX`) — the
+exact scheme `@cloudflare/blindrsa-ts` uses.
 
 ## The anonymity invariant
 
@@ -78,13 +79,16 @@ except as AES-256-GCM ciphertext written to the local DB.
 library FreedInk uses (`@cloudflare/blindrsa-ts`, pinned `0.4.6`):
 
 1. Rust generates a per-group key and exports SPKI.
-2. The TS client blinds a nonce under `freedink-vote:<version>`.
+2. The TS client blinds a nonce under `<prefix>:<version>`.
 3. Rust blind-signs the TS-produced blinded message.
 4. The TS client finalizes + verifies — must succeed.
 
-It also asserts cross-version binding (a v1 token must not verify under v2) and
-that a server-side metadata mismatch is rejected at finalize. A passing run
-prints `INTEROP OK`.
+It runs the full flow under the default `freedink-vote` prefix and again under a
+non-default `deforum-ban` prefix (proving `SIGNET_INFO_PREFIX` interops with the
+real library), and asserts cross-version binding (a v1 token must not verify
+under v2), cross-prefix binding (a `deforum-ban` token must not verify under
+`freedink-vote`), and that a server-side metadata mismatch is rejected at
+finalize. A passing run prints `INTEROP OK`.
 
 ```sh
 ./interop/run.sh
@@ -109,6 +113,7 @@ cargo test --release             # unit + integration tests (mTLS, invariants, a
 | `SIGNET_BIND` | no | `0.0.0.0:8443` | Listen address. |
 | `SIGNET_DB` | no | `signet.db` | SQLite path. |
 | `SIGNET_KEY_BITS` | no | `2048` | New-key modulus size (2048–4096, multiple of 16). |
+| `SIGNET_INFO_PREFIX` | no | `freedink-vote` | Public-metadata namespace. The signed metadata is `<prefix>:<version_id>`. Keep `freedink-vote` for FreedInk; set e.g. `deforum-ban` for a Deforum deployment. **Must be byte-identical across the client, this signer, and the verifier or every signature fails closed at redemption.** Restricted to ASCII letters, digits, `-`, `_`, `.` (1–64); anything else (including `:`, whitespace, non-ASCII) is rejected at startup. |
 | `SIGNET_AUTO_CREATE_KEYS` | no | `true` | Lazily create a group key on first `/sign` or `/key`. |
 | `SIGNET_RL_PARTICIPANT_MAX` | no | `5` | Max issuances per participant per window. |
 | `SIGNET_RL_GLOBAL_MAX` | no | `1000` | Max issuances across all participants per window. |
@@ -190,9 +195,12 @@ This pass builds the service only. To wire FreedInk in (separate branch):
 - **Mapping:** `group_id` = blog id; `participant_id` = the stable user id used
   for FreedInk's per-`(user, version)` review check; `version_id` = the post
   version id.
-- **Metadata:** the public metadata bytes are `freedink-vote:<version_id>`,
-  matching `versionInfo()` in FreedInk's `src/lib/{server,client}/vote-token.ts`.
-  Do not change this string on either side without changing both.
+- **Metadata:** the public metadata bytes are `<prefix>:<version_id>`, where the
+  prefix is `SIGNET_INFO_PREFIX` (default `freedink-vote`), matching
+  `versionInfo()` in FreedInk's `src/lib/{server,client}/vote-token.ts`. Do not
+  change the prefix on one side without changing it on every side (client,
+  signer, verifier) — a mismatch fails closed at redemption. FreedInk keeps the
+  default; a separate consumer (e.g. Deforum's `deforum-ban`) sets its own.
 - **Issuance:** FreedInk's `/api/blog/vote-token` handler stops signing locally.
   It calls `POST /sign` on Signet (over mTLS, presenting its client cert) with
   the blinded message the browser produced, and returns the `blind_signature`
@@ -209,8 +217,9 @@ This pass builds the service only. To wire FreedInk in (separate branch):
 ## Security notes for an auditor
 
 - **Interop is proven** against the real `@cloudflare/blindrsa-ts` in both
-  directions (Rust-signs/TS-verifies and TS-blinds/Rust-signs/TS-finalizes), plus
-  cross-version binding. See `interop/`.
+  directions (Rust-signs/TS-verifies and TS-blinds/Rust-signs/TS-finalizes),
+  under both the default `freedink-vote` prefix and a non-default `deforum-ban`
+  prefix, plus cross-version and cross-prefix binding. See `interop/`.
 - **Private keys at rest** are AES-256-GCM sealed under the env KEK, with the
   `(group_id, key_id)` bound as additional authenticated data; the DB never
   holds plaintext PKCS#8 (`tests/at_rest.rs` asserts this).

@@ -2,7 +2,9 @@
 //!
 //! Scheme: RSAPBSSA-SHA384-PSS-Randomized (RFC 9474 + the public-metadata
 //! extension, draft-amjad-cfrg-partially-blind-rsa). The public metadata is the
-//! version info string `freedink-vote:<version_id>` (see [`version_info`]).
+//! version info string `<prefix>:<version_id>` (see [`version_info`]), where the
+//! prefix is a per-deployment constant (`SIGNET_INFO_PREFIX`, default
+//! `freedink-vote`).
 //!
 //! INTEROP: proven against `@cloudflare/blindrsa-ts`
 //! `RSAPBSSA.SHA384.PSS.Randomized` (the library FreedInk runs). A blinded
@@ -28,11 +30,20 @@ type KeyPair = PartiallyBlindKeyPair<Sha384, PSS, Randomized>;
 type SecretKey = PartiallyBlindSecretKey<Sha384, PSS, Randomized>;
 type PublicKey = PartiallyBlindPublicKey<Sha384, PSS, Randomized>;
 
-/// The public-metadata byte string FreedInk binds for a version.
+/// The public-metadata byte string the signer binds for a version.
 ///
-/// MUST match `versionInfo` in FreedInk's `vote-token.ts`:
-/// `freedink-vote:<versionId>`, UTF-8. Both sides derive the per-metadata key
-/// from these exact bytes; any divergence makes signatures fail to verify.
+/// The bytes are `<prefix>:<version_id>`, UTF-8. `prefix` is a per-deployment
+/// constant (`SIGNET_INFO_PREFIX`, default `freedink-vote`); `version_id` is the
+/// per-request action key. Both sides — the client that blinds, the configured
+/// signer, and the verifier that redeems — MUST agree on these exact bytes, or
+/// the per-metadata key derivation diverges and every signature fails to verify
+/// (fail-closed at redemption).
+///
+/// For FreedInk the prefix is `freedink-vote`, so the bytes are
+/// `freedink-vote:<versionId>` — byte-identical to `versionInfo` in FreedInk's
+/// `vote-token.ts`. A Deforum deployment sets `deforum-ban`. The prefix itself
+/// never contains a `:` (validated at startup, see `config::Config::from_env`):
+/// the colon is the separator this function inserts.
 ///
 /// CLIENT NOTE (for anyone using `blind-rsa-signatures` as the client, e.g. in
 /// tests): unlike `@cloudflare/blindrsa-ts` — whose `blind()` derives the
@@ -43,8 +54,8 @@ type PublicKey = PartiallyBlindPublicKey<Sha384, PSS, Randomized>;
 /// way (interop is proven in `interop/`); only the Rust API surface differs.
 /// The server side here is unaffected: [`blind_sign`] derives the secret key
 /// before signing.
-pub fn version_info(version_id: &str) -> Vec<u8> {
-    format!("freedink-vote:{version_id}").into_bytes()
+pub fn version_info(prefix: &str, version_id: &str) -> Vec<u8> {
+    format!("{prefix}:{version_id}").into_bytes()
 }
 
 /// A freshly generated group keypair, ready to be persisted. The private key is
@@ -105,23 +116,26 @@ pub fn generate_group_key(bits: usize) -> Result<GeneratedKey, String> {
 
 /// Blind-sign a caller-supplied blinded message under the version metadata.
 ///
-/// `pkcs8_der` is the decrypted master private key. `blinded_message` is the
-/// raw blinded integer bytes from the client (exactly modulus-length). The
-/// returned blind signature is modulus-length bytes. This does NOT unblind and
-/// cannot recover the nonce.
+/// `pkcs8_der` is the decrypted master private key. `info_prefix` is the
+/// per-deployment metadata namespace (`SIGNET_INFO_PREFIX`, e.g. `freedink-vote`
+/// or `deforum-ban`) bound together with `version_id` as `<prefix>:<version_id>`
+/// (see [`version_info`]). `blinded_message` is the raw blinded integer bytes
+/// from the client (exactly modulus-length). The returned blind signature is
+/// modulus-length bytes. This does NOT unblind and cannot recover the nonce.
 ///
 /// The crate derives the per-metadata secret exponent `d'` and computes
 /// `s = m^d' mod n`, internally re-checking `m == s^e' mod n` before returning
 /// (defends against fault attacks).
 pub fn blind_sign(
     pkcs8_der: &[u8],
+    info_prefix: &str,
     version_id: &str,
     blinded_message: &[u8],
 ) -> Result<Vec<u8>, BrsaError> {
     let sk = SecretKey::from_der(pkcs8_der)?;
     let pk = sk.public_key()?;
     let kp = KeyPair { pk, sk };
-    let info = version_info(version_id);
+    let info = version_info(info_prefix, version_id);
     let derived = kp.derive_key_pair_for_metadata(&info)?;
     let sig = derived.sk.blind_sign(blinded_message)?;
     // BlindSignature is a newtype over Vec<u8>; take the inner bytes.
@@ -145,26 +159,30 @@ mod tests {
 
     #[test]
     fn version_info_matches_freedink_format() {
-        assert_eq!(version_info("post-v1"), b"freedink-vote:post-v1");
+        // Default prefix: byte-identical to FreedInk's versionInfo().
+        assert_eq!(version_info("freedink-vote", "post-v1"), b"freedink-vote:post-v1");
+        // A non-default prefix (e.g. Deforum) follows the same `<prefix>:<id>`
+        // layout, only the namespace changes.
+        assert_eq!(version_info("deforum-ban", "r1"), b"deforum-ban:r1");
     }
 
-    #[test]
-    fn full_roundtrip_self_consistent() {
-        // Mirror the production split using the crate's own client primitives:
-        // derive pubkey, blind, sign (service), finalize, verify.
+    /// Mirror the production split using the crate's own client primitives:
+    /// derive pubkey, blind, sign (service), finalize, verify — under an
+    /// arbitrary metadata prefix. Proves the prefix is threaded end-to-end.
+    fn roundtrip_self_consistent(prefix: &str) {
         let k = key();
         let pk = public_key_from_spki(&k.spki_der).unwrap();
         let sk = SecretKey::from_der(&k.pkcs8_der).unwrap();
         let kp = KeyPair { pk, sk };
-        let info = version_info("post-v1");
+        let info = version_info(prefix, "post-v1");
         let derived = kp.derive_key_pair_for_metadata(&info).unwrap();
 
         let msg = b"unblinded-token-nonce";
         let blinding = derived.pk.blind(&mut DefaultRng, msg, Some(&info)).unwrap();
 
-        // Service path: only the master PKCS#8 + blinded message + version_id.
+        // Service path: only the master PKCS#8 + prefix + blinded message + version_id.
         let blind_sig =
-            blind_sign(&k.pkcs8_der, "post-v1", blinding.blind_message.as_ref()).unwrap();
+            blind_sign(&k.pkcs8_der, prefix, "post-v1", blinding.blind_message.as_ref()).unwrap();
         let blind_sig = blind_rsa_signatures::BlindSignature(blind_sig);
 
         let sig = derived
@@ -178,13 +196,25 @@ mod tests {
     }
 
     #[test]
+    fn full_roundtrip_self_consistent() {
+        // FreedInk's prefix: the back-compat default path.
+        roundtrip_self_consistent("freedink-vote");
+    }
+
+    #[test]
+    fn full_roundtrip_self_consistent_custom_prefix() {
+        // Deforum's prefix: the configurable path that unblocks the remote signer.
+        roundtrip_self_consistent("deforum-ban");
+    }
+
+    #[test]
     fn cross_version_metadata_binding_fails() {
         // A token blinded+signed under v1 must NOT verify under v2.
         let k = key();
         let sk = SecretKey::from_der(&k.pkcs8_der).unwrap();
         let pk = public_key_from_spki(&k.spki_der).unwrap();
         let kp = KeyPair { pk, sk };
-        let info_v1 = version_info("post-v1");
+        let info_v1 = version_info("freedink-vote", "post-v1");
         let derived_v1 = kp.derive_key_pair_for_metadata(&info_v1).unwrap();
 
         let msg = b"nonce";
@@ -193,7 +223,8 @@ mod tests {
             .blind(&mut DefaultRng, msg, Some(&info_v1))
             .unwrap();
         let blind_sig =
-            blind_sign(&k.pkcs8_der, "post-v1", blinding.blind_message.as_ref()).unwrap();
+            blind_sign(&k.pkcs8_der, "freedink-vote", "post-v1", blinding.blind_message.as_ref())
+                .unwrap();
         let blind_sig = blind_rsa_signatures::BlindSignature(blind_sig);
         let sig = derived_v1
             .pk
@@ -201,11 +232,48 @@ mod tests {
             .unwrap();
 
         // Verify under v2 metadata: must fail.
-        let info_v2 = version_info("post-v2");
+        let info_v2 = version_info("freedink-vote", "post-v2");
         let derived_v2 = kp.derive_key_pair_for_metadata(&info_v2).unwrap();
         let res = derived_v2
             .pk
             .verify(&sig, blinding.msg_randomizer, msg, Some(&info_v2));
         assert!(res.is_err(), "v1 token must not verify under v2 metadata");
+    }
+
+    #[test]
+    fn cross_prefix_metadata_binding_fails() {
+        // A token bound to one prefix must NOT verify under a different prefix
+        // (same version_id). This is the property that makes a Deforum signer's
+        // tokens fail closed against a FreedInk verifier and vice-versa.
+        let k = key();
+        let sk = SecretKey::from_der(&k.pkcs8_der).unwrap();
+        let pk = public_key_from_spki(&k.spki_der).unwrap();
+        let kp = KeyPair { pk, sk };
+        let info_a = version_info("freedink-vote", "v1");
+        let derived_a = kp.derive_key_pair_for_metadata(&info_a).unwrap();
+
+        let msg = b"nonce";
+        let blinding = derived_a
+            .pk
+            .blind(&mut DefaultRng, msg, Some(&info_a))
+            .unwrap();
+        let blind_sig =
+            blind_sign(&k.pkcs8_der, "freedink-vote", "v1", blinding.blind_message.as_ref())
+                .unwrap();
+        let blind_sig = blind_rsa_signatures::BlindSignature(blind_sig);
+        let sig = derived_a
+            .pk
+            .finalize(&blind_sig, &blinding, msg, Some(&info_a))
+            .unwrap();
+
+        let info_b = version_info("deforum-ban", "v1");
+        let derived_b = kp.derive_key_pair_for_metadata(&info_b).unwrap();
+        let res = derived_b
+            .pk
+            .verify(&sig, blinding.msg_randomizer, msg, Some(&info_b));
+        assert!(
+            res.is_err(),
+            "a freedink-vote token must not verify under a deforum-ban prefix"
+        );
     }
 }

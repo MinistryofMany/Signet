@@ -127,6 +127,8 @@ pub struct ServerOpts {
     /// Admin identities (empty = rotation disabled).
     pub admin_ids: BTreeSet<String>,
     pub auto_create_keys: bool,
+    /// Public-metadata namespace prefix (`SIGNET_INFO_PREFIX`).
+    pub info_prefix: String,
 }
 
 impl Default for ServerOpts {
@@ -146,6 +148,8 @@ impl Default for ServerOpts {
             allowed_client_ids: BTreeSet::new(),
             admin_ids: BTreeSet::new(),
             auto_create_keys: true,
+            // Default matches Config::from_env (FreedInk wire format).
+            info_prefix: signet::config::DEFAULT_INFO_PREFIX.to_string(),
         }
     }
 }
@@ -186,6 +190,7 @@ pub async fn start_server(pki: &Pki, opts: ServerOpts) -> Server {
         keygen,
         auto_create_keys: opts.auto_create_keys,
         key_bits: opts.key_bits,
+        info_prefix: opts.info_prefix.clone(),
     });
     let app = signet::router(state);
 
