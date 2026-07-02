@@ -157,32 +157,45 @@ impl Db {
         .map_err(|e| e.to_string())
     }
 
-    /// Insert a new active key. Fails if one already exists (UNIQUE index).
-    pub fn insert_key(
+    /// Insert a fresh active key, sealing its private blob under the real
+    /// auto-increment `key_id` ATOMICALLY. The sealed blob is AES-GCM AAD-bound
+    /// to `key_id`, which is only known once the row is inserted, so this inserts
+    /// the row with a transient empty blob, calls `seal(key_id)` to produce the
+    /// real ciphertext, and writes it back - all inside ONE transaction. A crash
+    /// or a `seal` failure rolls the whole thing back, so a group can never be
+    /// left with an "active" row whose stored blob is bound to the wrong id and
+    /// can therefore never be decrypted (audit L4). Fails if an active key
+    /// already exists (partial UNIQUE index).
+    pub fn insert_key_sealed<F>(
         &self,
         group_id: &str,
         spki_der: &[u8],
-        sealed_pkcs8: &[u8],
-    ) -> Result<i64, String> {
-        let conn = self.lock_conn();
-        conn.execute(
-            "INSERT INTO group_keys (group_id, spki_der, sealed_pkcs8, created_at) \
-             VALUES (?1, ?2, ?3, ?4)",
-            params![group_id, spki_der, sealed_pkcs8, now_secs()],
-        )
-        .map_err(|e| e.to_string())?;
-        Ok(conn.last_insert_rowid())
+        seal: F,
+    ) -> Result<i64, String>
+    where
+        F: FnOnce(i64) -> Result<Vec<u8>, String>,
+    {
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let key_id = insert_active_key_resealed(&tx, group_id, spki_der, seal)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(key_id)
     }
 
-    /// Atomically retire the current active key and insert a new one,
-    /// returning the new key id. Both happen in one transaction so the
-    /// at-most-one-active invariant is never transiently violated.
-    pub fn rotate_key(
+    /// Atomically retire the current active key and insert a fresh one, sealing
+    /// the new private blob under its assigned id - ALL in one transaction. A
+    /// crash never leaves either a doubly-active group (the at-most-one-active
+    /// invariant holds transiently) or an unopenable active key (audit L4).
+    /// Returns the new key id.
+    pub fn rotate_key_sealed<F>(
         &self,
         group_id: &str,
         spki_der: &[u8],
-        sealed_pkcs8: &[u8],
-    ) -> Result<i64, String> {
+        seal: F,
+    ) -> Result<i64, String>
+    where
+        F: FnOnce(i64) -> Result<Vec<u8>, String>,
+    {
         let mut conn = self.lock_conn();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         tx.execute(
@@ -190,15 +203,9 @@ impl Db {
             params![now_secs(), group_id],
         )
         .map_err(|e| e.to_string())?;
-        tx.execute(
-            "INSERT INTO group_keys (group_id, spki_der, sealed_pkcs8, created_at) \
-             VALUES (?1, ?2, ?3, ?4)",
-            params![group_id, spki_der, sealed_pkcs8, now_secs()],
-        )
-        .map_err(|e| e.to_string())?;
-        let id = tx.last_insert_rowid();
+        let key_id = insert_active_key_resealed(&tx, group_id, spki_der, seal)?;
         tx.commit().map_err(|e| e.to_string())?;
-        Ok(id)
+        Ok(key_id)
     }
 
     /// Record-first reservation of an issuance slot. Inserts the issuance row
@@ -302,7 +309,46 @@ pub fn get_or_create_key(
     create_key(db, kek, group_id, bits)
 }
 
-/// Create a fresh active key for a group and persist it (encrypted).
+/// Within `tx`: insert an active-key row with a transient empty sealed blob,
+/// seal the private key under the assigned auto-increment id, and write it back.
+/// Returns the new key id. The blob's AES-GCM AAD binds the real key_id, which
+/// is only known after the insert, so the insert + reseal + update must live in
+/// one transaction (the caller commits it); any error here leaves the whole
+/// transaction to roll back, so no half-sealed / unopenable row is ever
+/// persisted (audit L4). The empty placeholder blob exists only inside the
+/// uncommitted transaction and is always overwritten before commit.
+fn insert_active_key_resealed<F>(
+    tx: &rusqlite::Transaction<'_>,
+    group_id: &str,
+    spki_der: &[u8],
+    seal: F,
+) -> Result<i64, String>
+where
+    F: FnOnce(i64) -> Result<Vec<u8>, String>,
+{
+    tx.execute(
+        "INSERT INTO group_keys (group_id, spki_der, sealed_pkcs8, created_at) \
+         VALUES (?1, ?2, ?3, ?4)",
+        params![group_id, spki_der, Vec::<u8>::new(), now_secs()],
+    )
+    .map_err(|e| e.to_string())?;
+    let key_id = tx.last_insert_rowid();
+    let sealed = seal(key_id)?;
+    let updated = tx
+        .execute(
+            "UPDATE group_keys SET sealed_pkcs8 = ?1 WHERE key_id = ?2",
+            params![sealed, key_id],
+        )
+        .map_err(|e| e.to_string())?;
+    if updated != 1 {
+        return Err(format!(
+            "reseal updated {updated} rows for key_id {key_id} (expected 1)"
+        ));
+    }
+    Ok(key_id)
+}
+
+/// Create a fresh active key for a group and persist it (encrypted, atomically).
 pub fn create_key(
     db: &Db,
     kek: &Kek,
@@ -310,37 +356,94 @@ pub fn create_key(
     bits: usize,
 ) -> Result<(Vec<u8>, Vec<u8>), String> {
     let generated = crate::crypto::generate_group_key(bits)?;
-    // The sealed blob binds key_id as AES-GCM associated data, but the
-    // auto-increment key_id is only known after the row is inserted. So: insert
-    // with a placeholder seal (bound to id 0), learn the real key_id, reseal
-    // bound to that id, and update the row in place. The placeholder never
-    // leaves the DB except as the immediately-overwritten value.
-    let placeholder = kek.seal(group_id, 0, &generated.pkcs8_der)?;
-    let key_id = db.insert_key(group_id, &generated.spki_der, &placeholder)?;
-    let sealed = kek.seal(group_id, key_id, &generated.pkcs8_der)?;
-    db.update_sealed(key_id, &sealed)?;
+    db.insert_key_sealed(group_id, &generated.spki_der, |key_id| {
+        kek.seal(group_id, key_id, &generated.pkcs8_der)
+    })?;
     Ok((generated.pkcs8_der, generated.spki_der))
 }
 
-/// Rotate a group's key, persisting the new one encrypted at rest.
+/// Rotate a group's key, persisting the new one encrypted at rest (atomically).
 pub fn rotate_key(db: &Db, kek: &Kek, group_id: &str, bits: usize) -> Result<Vec<u8>, String> {
     let generated = crate::crypto::generate_group_key(bits)?;
-    let placeholder = kek.seal(group_id, 0, &generated.pkcs8_der)?;
-    let key_id = db.rotate_key(group_id, &generated.spki_der, &placeholder)?;
-    let sealed = kek.seal(group_id, key_id, &generated.pkcs8_der)?;
-    db.update_sealed(key_id, &sealed)?;
+    db.rotate_key_sealed(group_id, &generated.spki_der, |key_id| {
+        kek.seal(group_id, key_id, &generated.pkcs8_der)
+    })?;
     Ok(generated.spki_der)
 }
 
-impl Db {
-    /// Update the sealed blob for a key id (used after learning the auto id).
-    pub fn update_sealed(&self, key_id: i64, sealed_pkcs8: &[u8]) -> Result<(), String> {
-        let conn = self.lock_conn();
-        conn.execute(
-            "UPDATE group_keys SET sealed_pkcs8 = ?1 WHERE key_id = ?2",
-            params![sealed_pkcs8, key_id],
-        )
-        .map_err(|e| e.to_string())?;
-        Ok(())
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_kek() -> Kek {
+        Kek::from_encoded(&hex::encode([0x5au8; 32])).unwrap()
+    }
+
+    #[test]
+    fn insert_key_sealed_rolls_back_when_reseal_fails() {
+        // Models a mid-op failure in the (formerly non-atomic) insert -> reseal
+        // window. It MUST leave no row behind - a group must never end up with an
+        // "active" key whose stored blob is bound to the wrong id and can never be
+        // decrypted (audit L4).
+        let db = Db::open_in_memory().unwrap();
+        let r = db.insert_key_sealed("g1", b"spki-der", |_key_id| Err("seal boom".to_string()));
+        assert!(r.is_err());
+        assert!(
+            db.active_key("g1").unwrap().is_none(),
+            "a failed reseal must roll the inserted row back (no bricked active key)"
+        );
+    }
+
+    #[test]
+    fn insert_key_sealed_binds_the_blob_to_the_assigned_key_id() {
+        // On success the stored blob is sealed under the row's REAL key_id, so it
+        // round-trips through Kek::open - the exact property the non-atomic path
+        // could silently violate on a crash between insert and reseal.
+        let kek = test_kek();
+        let db = Db::open_in_memory().unwrap();
+        let secret = b"private-key-bytes";
+        let key_id = db
+            .insert_key_sealed("g1", b"spki-der", |key_id| kek.seal("g1", key_id, secret))
+            .unwrap();
+        let active = db.active_key("g1").unwrap().expect("active key present");
+        assert_eq!(active.key_id, key_id);
+        let opened = kek.open("g1", active.key_id, &active.sealed_pkcs8).unwrap();
+        assert_eq!(opened, secret);
+    }
+
+    #[test]
+    fn rotate_key_sealed_retires_old_and_binds_new_blob() {
+        let kek = test_kek();
+        let db = Db::open_in_memory().unwrap();
+        db.insert_key_sealed("g1", b"spki-1", |id| kek.seal("g1", id, b"secret-1"))
+            .unwrap();
+        let new_id = db
+            .rotate_key_sealed("g1", b"spki-2", |id| kek.seal("g1", id, b"secret-2"))
+            .unwrap();
+        let active = db.active_key("g1").unwrap().expect("active key present");
+        assert_eq!(active.key_id, new_id, "the rotated-in key is active");
+        assert_eq!(active.spki_der, b"spki-2");
+        // The new active blob opens under its own id.
+        let opened = kek.open("g1", active.key_id, &active.sealed_pkcs8).unwrap();
+        assert_eq!(opened, b"secret-2");
+    }
+
+    #[test]
+    fn rotate_key_sealed_rolls_back_when_reseal_fails() {
+        // A failed reseal during rotation must roll back BOTH the retire and the
+        // insert, leaving the original active key intact and openable.
+        let kek = test_kek();
+        let db = Db::open_in_memory().unwrap();
+        db.insert_key_sealed("g1", b"spki-1", |id| kek.seal("g1", id, b"secret-1"))
+            .unwrap();
+        let before = db.active_key("g1").unwrap().expect("active key present");
+
+        let r = db.rotate_key_sealed("g1", b"spki-2", |_id| Err("seal boom".to_string()));
+        assert!(r.is_err());
+
+        let after = db.active_key("g1").unwrap().expect("original key still active");
+        assert_eq!(after.key_id, before.key_id, "the original key stays active");
+        let opened = kek.open("g1", after.key_id, &after.sealed_pkcs8).unwrap();
+        assert_eq!(opened, b"secret-1");
     }
 }
