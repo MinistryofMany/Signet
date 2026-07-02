@@ -50,3 +50,20 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
+
+  interop:
+    name: cross-language interop (Rust <-> TS)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      # Byte-for-byte check: a Signet (Rust) blind signature must verify under the
+      # exact @cloudflare/blindrsa-ts FreedInk uses, and cross-version / metadata
+      # mismatches must be rejected. Builds the interop_tool example, installs the
+      # pinned TS lib, and runs the driver; prints INTEROP OK on success.
+      - name: Run interop harness
+        run: bash interop/run.sh
