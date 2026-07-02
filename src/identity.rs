@@ -38,6 +38,7 @@ use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::TlsAcceptor;
 use tower::Service;
@@ -169,15 +170,32 @@ pub fn identity_names_from_leaf(leaf_der: &[u8]) -> Vec<String> {
 /// An [`Accept`] implementation that terminates TLS, pins the peer identity
 /// against [`IdentityPolicy`], and wraps the per-connection service so every
 /// request carries the resolved [`ClientIdentity`] in its extensions.
+/// Default TLS handshake timeout. A peer that opens a connection but stalls the
+/// handshake (slow-loris) is dropped after this, so half-open accept futures
+/// cannot accumulate. Generous relative to a real handshake (sub-second on the
+/// internal network) while still bounded.
+const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[derive(Clone)]
 pub struct IdentityAcceptor {
     config: Arc<ServerConfig>,
     policy: IdentityPolicy,
+    handshake_timeout: Duration,
 }
 
 impl IdentityAcceptor {
     pub fn new(config: Arc<ServerConfig>, policy: IdentityPolicy) -> Self {
-        Self { config, policy }
+        Self {
+            config,
+            policy,
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+        }
+    }
+
+    /// Override the TLS handshake timeout (tuning / tests).
+    pub fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.handshake_timeout = timeout;
+        self
     }
 }
 
@@ -193,9 +211,26 @@ where
     fn accept(&self, stream: I, service: S) -> Self::Future {
         let config = self.config.clone();
         let policy = self.policy.clone();
+        let handshake_timeout = self.handshake_timeout;
         Box::pin(async move {
             let acceptor = TlsAcceptor::from(config);
-            let tls = acceptor.accept(stream).await?;
+            // Bound the handshake: a peer that connects but never completes the
+            // TLS handshake (slow-loris) must not pin an accept future open
+            // indefinitely. On timeout we drop the connection with a TimedOut
+            // error rather than awaiting the peer forever.
+            let tls = match tokio::time::timeout(handshake_timeout, acceptor.accept(stream)).await {
+                Ok(result) => result?,
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        timeout_ms = handshake_timeout.as_millis() as u64,
+                        "dropping connection: TLS handshake exceeded the timeout"
+                    );
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "TLS handshake timed out",
+                    ));
+                }
+            };
 
             // The chain was already verified by WebPkiClientVerifier; here we
             // only read the leaf to derive identity. mTLS is mandatory, so a
@@ -351,5 +386,85 @@ mod tests {
         // Even the configured client cannot reach admin.
         let id = p.classify(&["freedink".to_string()]).unwrap();
         assert!(!id.is_admin());
+    }
+
+    #[tokio::test]
+    async fn tls_handshake_past_the_timeout_is_dropped() {
+        use axum_server::accept::Accept;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+        use rustls::ServerConfig;
+        use std::collections::BTreeSet;
+        use std::pin::Pin;
+        use std::sync::Arc;
+        use std::task::{Context as TaskContext, Poll};
+        use std::time::Duration;
+        use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+        // A stream that accepts writes but never yields read data, so the TLS
+        // server side blocks forever waiting for the ClientHello (slow-loris).
+        struct StalledStream;
+        impl AsyncRead for StalledStream {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut TaskContext<'_>,
+                _buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Pending
+            }
+        }
+        impl AsyncWrite for StalledStream {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut TaskContext<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Ready(Ok(buf.len()))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _cx: &mut TaskContext<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        // Install the process crypto provider (idempotent across tests).
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        // Minimal self-signed server config; the handshake never gets far enough
+        // to validate it (the timeout fires first), so no CA / client auth needed.
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let cert_der = CertificateDer::from(cert.der().to_vec());
+        let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
+        let config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+            .unwrap();
+
+        let acceptor = IdentityAcceptor::new(
+            Arc::new(config),
+            IdentityPolicy::new(BTreeSet::new(), BTreeSet::new()),
+        )
+        .with_handshake_timeout(Duration::from_millis(100));
+
+        // Outer guard: a regression (no handshake timeout) would hang here and
+        // fail the test deterministically instead of blocking forever.
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(3), acceptor.accept(StalledStream, ()))
+                .await
+                .expect("accept() did not return within 3s - handshake timeout missing?");
+
+        // Avoid `expect_err`, which would require the Ok variant to be `Debug`.
+        match outcome {
+            Ok(_) => panic!("a stalled handshake must be rejected, not admitted"),
+            Err(err) => assert_eq!(err.kind(), io::ErrorKind::TimedOut),
+        }
     }
 }
