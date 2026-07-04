@@ -429,7 +429,9 @@ impl Db {
                     .optional()
                     .map_err(|e| e.to_string())?;
                 match existing {
-                    Some((existing_ref, existing_owner)) if owner_eq(&existing_owner, owner_tag) => {
+                    Some((existing_ref, existing_owner))
+                        if owner_eq(&existing_owner, owner_tag) =>
+                    {
                         Ok(DedupRegister::AlreadyYours {
                             entry_ref: existing_ref,
                         })

@@ -290,7 +290,10 @@ mod tests {
         // safe-prime keygen is high-variance and the full test suite can
         // saturate a slow shared CI runner; wait_ready returns as soon as the
         // key is ready, so the ceiling only bounds the worst case.
-        let st = svc.wait_ready("g1", Duration::from_secs(360)).await.unwrap();
+        let st = svc
+            .wait_ready("g1", Duration::from_secs(360))
+            .await
+            .unwrap();
         assert_eq!(st, KeygenStatus::Ready);
         // Exactly one active key exists for the group (dedup held).
         assert!(db.active_key("g1").unwrap().is_some());
@@ -305,7 +308,10 @@ mod tests {
         let quick = svc.wait_ready("g1", Duration::from_nanos(1)).await.unwrap();
         assert!(matches!(quick, KeygenStatus::Pending | KeygenStatus::Ready));
         // Given enough time, it becomes ready (360s ceiling — see above).
-        let st = svc.wait_ready("g1", Duration::from_secs(360)).await.unwrap();
+        let st = svc
+            .wait_ready("g1", Duration::from_secs(360))
+            .await
+            .unwrap();
         assert_eq!(st, KeygenStatus::Ready);
     }
 

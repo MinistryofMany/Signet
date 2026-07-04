@@ -232,10 +232,8 @@ pub fn prepare_prf_boot(db: &Db, kek: &Kek, args: PrfBootArgs<'_>) -> Result<Prf
                 },
             };
 
-            let keys = PrfKeys::from_seed(
-                *seed,
-                pairwise.as_ref().map(|s| Zeroizing::new(s.to_vec())),
-            )?;
+            let keys =
+                PrfKeys::from_seed(*seed, pairwise.as_ref().map(|s| Zeroizing::new(s.to_vec())))?;
             let derived = keys.public_key_b64();
             if derived != pin {
                 // Both values are public keys — safe to surface for ops.

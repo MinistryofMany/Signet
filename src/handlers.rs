@@ -786,8 +786,7 @@ pub async fn dedup_release(
         "owner_handle length out of range",
     )?;
     let db = state.db.clone();
-    let outcome =
-        run_db_blocking(move || db.release_dedup(&entry_ref, &req.owner_handle)).await?;
+    let outcome = run_db_blocking(move || db.release_dedup(&entry_ref, &req.owner_handle)).await?;
     // Uniform, outcome-free log line (see the module doc).
     tracing::info!(identity = %identity.name, endpoint = "dedup/release", "served");
     let status = match outcome {
