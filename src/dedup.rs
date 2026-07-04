@@ -52,10 +52,27 @@ pub fn init_service_keys(db: &Db, kek: &Kek) -> Result<String, String> {
     rand::rngs::OsRng
         .try_fill_bytes(seed.as_mut())
         .map_err(|e| format!("OS RNG failure: {e}"))?;
-    // Derive first: if the seed were somehow unusable, nothing is persisted.
+    seal_master_seed(db, kek, &seed)
+}
+
+/// Seal a PROVIDED master seed into `service_keys`, returning the derived
+/// `pkS` in the pin encoding. Refuses if service keys already exist.
+///
+/// This is the deliberate-injection path for the integration test harness
+/// (which needs a FIXED seed to assert frozen vectors over the real HTTP
+/// surface). Production initialization always mints fresh OS randomness via
+/// [`init_service_keys`]; nothing routes user input here.
+pub fn seal_master_seed(
+    db: &Db,
+    kek: &Kek,
+    seed: &[u8; MASTER_SEED_LEN],
+) -> Result<String, String> {
+    if db.get_service_key(MASTER_SEED_PURPOSE)?.is_some() {
+        return Err("service keys are already initialized; refusing to overwrite".to_string());
+    }
     let keys = PrfKeys::from_seed(*seed, None)?;
     let pk = keys.public_key_b64();
-    let sealed = kek.seal(MASTER_SEED_PURPOSE, SERVICE_KEY_ID, seed.as_ref())?;
+    let sealed = kek.seal(MASTER_SEED_PURPOSE, SERVICE_KEY_ID, seed)?;
     if !db.insert_service_key(MASTER_SEED_PURPOSE, &sealed)? {
         return Err("service keys were initialized concurrently; refusing".to_string());
     }

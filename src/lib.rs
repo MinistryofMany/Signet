@@ -26,13 +26,28 @@ use state::AppState;
 use std::sync::Arc;
 
 /// Build the application router with all endpoints wired to `state`.
+///
+/// The PRF/dedup routes are mounted ONLY when `state.prf` is present (i.e.
+/// the fail-closed boot policy in [`dedup::prepare_prf_boot`] enabled the
+/// surface). Without it they 404 and the deployed /sign behavior is exactly
+/// what it was before the PRF surface existed.
 pub fn router(state: Arc<AppState>) -> Router {
-    Router::new()
+    let mut router = Router::new()
         .route("/healthz", get(handlers::healthz))
         .route("/sign", post(handlers::sign))
         .route("/key", get(handlers::get_key).post(handlers::create_key))
-        .route("/key/rotate", post(handlers::rotate_key))
-        .with_state(state)
+        .route("/key/rotate", post(handlers::rotate_key));
+    if state.prf.is_some() {
+        router = router
+            .route("/prf/pairwise", post(handlers::prf_pairwise))
+            .route("/prf/evaluate", post(handlers::prf_evaluate))
+            .route("/prf/public-key", get(handlers::prf_public_key))
+            .route("/prf/disclose", post(handlers::prf_disclose))
+            .route("/dedup/register", post(handlers::dedup_register))
+            .route("/dedup/release", post(handlers::dedup_release))
+            .route("/dedup/reassign", post(handlers::dedup_reassign));
+    }
+    router.with_state(state)
 }
 
 /// Serve the router over mTLS on an already-bound `std::net::TcpListener`, with

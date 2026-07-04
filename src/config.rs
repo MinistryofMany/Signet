@@ -3,12 +3,13 @@
 //! The KEK (key-encryption key) is the single most sensitive input. It is read
 //! from `SIGNET_KEK` (32 raw bytes, hex- or base64-encoded) and is NEVER
 //! persisted, logged, or returned by any endpoint. It exists only in process
-//! memory.
+//! memory. `SIGNET_IMPORT_PAIRWISE_HMAC` (the one-shot pairwise-secret import)
+//! follows the same consume-zeroize-remove pattern.
 
 use crate::keystore::Kek;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 #[derive(Clone)]
 pub struct Config {
@@ -47,6 +48,27 @@ pub struct Config {
     pub rl_key_identity_max: u32,
     /// Global rate limit for `/key*` endpoints, per window. Audit H1.
     pub rl_key_global_max: u32,
+    /// Allow-list of client identities permitted to call the `/prf/*` and
+    /// `/dedup/*` endpoints (SIGNET_PRF_CLIENT_IDS). Separate from — and
+    /// NEVER granted by — `allowed_client_ids` or its open back-compat mode.
+    /// Empty = PRF surface not configured (routes not mounted); an empty list
+    /// with initialized service keys refuses startup (fail-closed).
+    pub prf_client_ids: std::collections::BTreeSet<String>,
+    /// The pinned VOPRF public key `pkS` (base64url, no padding), as printed
+    /// by `signet init-service-keys`. Required whenever the PRF surface is
+    /// enabled; a mismatch with the derived key refuses startup.
+    pub dedup_pubkey_pin: Option<String>,
+    /// One-shot pairwise-secret import (SIGNET_IMPORT_PAIRWISE_HMAC): the
+    /// EXACT UTF-8 bytes of the live secret, consumed from the environment at
+    /// load (removed + zeroized) and sealed into `service_keys` at boot.
+    /// NOT trimmed: byte-stability with Minister's Node derivation requires
+    /// the bytes verbatim.
+    pub import_pairwise_hmac: Option<Zeroizing<Vec<u8>>>,
+    /// Per-identity rate limit for the `/prf/*` + `/dedup/*` endpoints, per
+    /// window (its own bucket, separate from /sign and /key*).
+    pub rl_prf_identity_max: u32,
+    /// Global rate limit for the `/prf/*` + `/dedup/*` endpoints, per window.
+    pub rl_prf_global_max: u32,
 }
 
 /// Parse a comma-separated env var into a set of trimmed, non-empty identities.
@@ -75,31 +97,57 @@ fn env_or<T: std::str::FromStr>(key: &str, default: T) -> Result<T, String> {
     }
 }
 
+/// Consume `SIGNET_KEK` from the environment: parse it, zeroize the raw copy,
+/// and remove the variable so it is not readable via /proc/<pid>/environ,
+/// inherited by a child process, or surfaced by a crash dump walking the
+/// environment block. The returned in-memory [`Kek`] is the only remaining
+/// copy and is itself zeroized on drop.
+///
+/// SAFETY: `remove_var` is sound here because this is called from `main`
+/// BEFORE the tokio runtime is built (audit L1) — for the serve path via
+/// [`Config::from_env`] and for the `init-service-keys` one-shot directly —
+/// so the process is still single-threaded and there is no concurrent env
+/// access. Callers must preserve that ordering.
+pub fn consume_kek_env() -> Result<Kek, String> {
+    let mut kek_raw = env_required("SIGNET_KEK")?;
+    let kek_result = Kek::from_encoded(&kek_raw);
+    // Wipe the encoded KEK from our heap copy as soon as it is parsed,
+    // regardless of whether parsing succeeded.
+    kek_raw.zeroize();
+    std::env::remove_var("SIGNET_KEK");
+    kek_result.map_err(|e| format!("SIGNET_KEK is invalid: {e}"))
+}
+
+/// Consume `SIGNET_IMPORT_PAIRWISE_HMAC` (if set): take the EXACT UTF-8 bytes
+/// (no trimming — byte-stability with Minister's live derivation), remove the
+/// variable from the environment, and return the bytes in a zeroizing buffer.
+/// Same single-threaded-before-runtime requirement as [`consume_kek_env`].
+fn consume_pairwise_import_env() -> Option<Zeroizing<Vec<u8>>> {
+    match std::env::var("SIGNET_IMPORT_PAIRWISE_HMAC") {
+        Ok(raw) => {
+            std::env::remove_var("SIGNET_IMPORT_PAIRWISE_HMAC");
+            Some(Zeroizing::new(raw.into_bytes()))
+        }
+        Err(_) => None,
+    }
+}
+
+/// The SQLite database path (`SIGNET_DB`, default `signet.db`). Shared by the
+/// serve path and the `init-service-keys` one-shot.
+pub fn db_path_from_env() -> Result<PathBuf, String> {
+    Ok(PathBuf::from(env_or("SIGNET_DB", "signet.db".to_string())?))
+}
+
 impl Config {
     pub fn from_env() -> Result<Self, String> {
         let bind: SocketAddr = env_or("SIGNET_BIND", "0.0.0.0:8443".parse().unwrap())?;
-        let db_path = PathBuf::from(env_or("SIGNET_DB", "signet.db".to_string())?);
+        let db_path = db_path_from_env()?;
         let tls_cert = PathBuf::from(env_required("SIGNET_TLS_CERT")?);
         let tls_key = PathBuf::from(env_required("SIGNET_TLS_KEY")?);
         let client_ca = PathBuf::from(env_required("SIGNET_CLIENT_CA")?);
 
-        let mut kek_raw = env_required("SIGNET_KEK")?;
-        let kek_result = Kek::from_encoded(&kek_raw);
-        // Wipe the encoded KEK from our heap copy as soon as it is parsed,
-        // regardless of whether parsing succeeded, so the raw key material does
-        // not linger in process memory.
-        kek_raw.zeroize();
-        // Remove the KEK from the process environment so it is not readable via
-        // /proc/<pid>/environ, inherited by any child process, or surfaced by a
-        // crash dump that walks the environment block. The in-memory `Kek` is
-        // the only remaining copy and is itself zeroized on drop.
-        //
-        // SAFETY: `remove_var` is sound here because `Config::from_env` is
-        // called from `main` BEFORE the tokio runtime is built (audit L1), so
-        // the process is still single-threaded and there is no concurrent env
-        // access. Callers must preserve that ordering.
-        std::env::remove_var("SIGNET_KEK");
-        let kek = kek_result.map_err(|e| format!("SIGNET_KEK is invalid: {e}"))?;
+        let kek = consume_kek_env()?;
+        let import_pairwise_hmac = consume_pairwise_import_env();
 
         let key_bits: usize = env_or("SIGNET_KEY_BITS", 2048usize)?;
         if !(2048..=4096).contains(&key_bits) || !key_bits.is_multiple_of(16) {
@@ -130,6 +178,13 @@ impl Config {
             keygen_max_concurrent,
             rl_key_identity_max: env_or("SIGNET_RL_KEY_IDENTITY_MAX", 10u32)?,
             rl_key_global_max: env_or("SIGNET_RL_KEY_GLOBAL_MAX", 100u32)?,
+            prf_client_ids: env_id_set("SIGNET_PRF_CLIENT_IDS"),
+            dedup_pubkey_pin: std::env::var("SIGNET_DEDUP_PUBKEY_PIN").ok(),
+            import_pairwise_hmac,
+            // The pairwise oracle sits on the token-mint hot path; defaults
+            // are generous but finite.
+            rl_prf_identity_max: env_or("SIGNET_RL_PRF_IDENTITY_MAX", 1000u32)?,
+            rl_prf_global_max: env_or("SIGNET_RL_PRF_GLOBAL_MAX", 5000u32)?,
         })
     }
 }

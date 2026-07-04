@@ -3,8 +3,23 @@
 use crate::db::Db;
 use crate::keygen::KeygenService;
 use crate::keystore::Kek;
+use crate::prf::PrfKeys;
 use crate::ratelimit::{KeyRateLimiter, RateLimiter};
+use std::collections::BTreeSet;
 use std::sync::Arc;
+
+/// State for the PRF/dedup surface. Present only when the fail-closed boot
+/// policy enabled it (service keys initialized, non-empty allow-list, public
+/// key pin verified); `None` means the `/prf/*` and `/dedup/*` routes are not
+/// even mounted.
+pub struct PrfState {
+    pub keys: PrfKeys,
+    /// The `SIGNET_PRF_CLIENT_IDS` allow-list, checked INSIDE each PRF/dedup
+    /// handler (per-route, fail-closed — mirroring the `is_admin()` gate).
+    pub allowed_client_ids: BTreeSet<String>,
+    /// The PRF surface's own rate-limit bucket (separate from /sign + /key*).
+    pub rate_limiter: KeyRateLimiter,
+}
 
 pub struct AppState {
     /// Shared with [`KeygenService`] so handlers and the keygen worker pool use
@@ -19,4 +34,6 @@ pub struct AppState {
     pub keygen: KeygenService,
     pub auto_create_keys: bool,
     pub key_bits: usize,
+    /// PRF/dedup surface state; `None` = surface disabled (routes unmounted).
+    pub prf: Option<PrfState>,
 }

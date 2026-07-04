@@ -12,14 +12,27 @@
 //!   - **admin**   — additionally may call `/key/rotate`. The allow-list is
 //!     `SIGNET_ADMIN_IDS`; if it is empty, `/key/rotate` is refused for
 //!     everyone (fail-closed: no admin identity configured => no rotation).
+//!   - **prf**     — admitted SOLELY via `SIGNET_PRF_CLIENT_IDS` (not on the
+//!     client/admin lists). May call only the `/prf/*` and `/dedup/*`
+//!     endpoints; the blind-RSA surface (`/sign`, `/key*`) refuses it, so
+//!     admitting Minister for PRF work never widens the /sign surface.
+//!
+//! PRF authorization is deliberately NOT granted by `classify`'s client rules:
+//! the open back-compat client list ("empty = any valid-chain cert") must
+//! never reach the PRF surface, which includes a raw HMAC oracle over the
+//! pairwise secret. Instead every identity carries a `prf_allowed` flag,
+//! matched ONLY against the dedicated `SIGNET_PRF_CLIENT_IDS` set, and every
+//! `/prf/*` / `/dedup/*` handler checks it per-route (mirroring the
+//! `is_admin()` gate on `/key/rotate`) — fail-closed at both layers.
 //!
 //! Enforcement happens in two places:
 //!   1. **Connection admission** (`IdentityAcceptor`): when an allow-list is
-//!      configured, a peer whose identity is on neither the client nor the
-//!      admin list is dropped at the TLS layer, before any HTTP runs.
+//!      configured, a peer whose identity is on none of the client, admin, or
+//!      PRF lists is dropped at the TLS layer, before any HTTP runs.
 //!   2. **Per-route gating** (the [`ClientIdentity`] extractor + role check in
 //!      the handlers): `/key/rotate` requires the `Admin` role even for an
-//!      otherwise-allowed client.
+//!      otherwise-allowed client; `/prf/*` and `/dedup/*` require
+//!      `prf_allowed`; `/sign` and `/key*` refuse `Prf`-role identities.
 //!
 //! How the cert reaches a handler: axum-server's standard serve path consumes
 //! the rustls connection into the hyper IO and never surfaces the peer
@@ -50,23 +63,41 @@ pub enum Role {
     Client,
     /// Allowed to do everything a client can, plus rotate keys.
     Admin,
+    /// Admitted SOLELY via the PRF allow-list: may call only the `/prf/*` and
+    /// `/dedup/*` endpoints. The blind-RSA surface refuses this role, so a
+    /// PRF-only identity (Minister) never gains /sign access as a side
+    /// effect of being admitted.
+    Prf,
 }
 
 /// A verified peer identity, derived from the mTLS leaf certificate.
 ///
 /// `name` is the identity that matched the allow-list (a CN or a DNS SAN), used
 /// for audit logging and as the per-identity rate-limit key. `role` is the
-/// authorization tier the identity was classified into.
+/// authorization tier the identity was classified into. `prf_allowed` is
+/// matched ONLY against `SIGNET_PRF_CLIENT_IDS` — never implied by the client
+/// list or its open back-compat mode.
 #[derive(Debug, Clone)]
 pub struct ClientIdentity {
     pub name: String,
     pub role: Role,
+    pub prf_allowed: bool,
 }
 
 impl ClientIdentity {
     /// True if this identity is permitted to rotate keys.
     pub fn is_admin(&self) -> bool {
         self.role == Role::Admin
+    }
+
+    /// True if this identity may call the blind-RSA surface (/sign, /key*).
+    pub fn may_sign(&self) -> bool {
+        matches!(self.role, Role::Client | Role::Admin)
+    }
+
+    /// True if this identity may call the PRF surface (/prf/*, /dedup/*).
+    pub fn may_prf(&self) -> bool {
+        self.prf_allowed
     }
 }
 
@@ -78,13 +109,19 @@ impl ClientIdentity {
 pub struct IdentityPolicy {
     allowed_clients: Arc<BTreeSet<String>>,
     admins: Arc<BTreeSet<String>>,
+    prf_clients: Arc<BTreeSet<String>>,
 }
 
 impl IdentityPolicy {
-    pub fn new(allowed_clients: BTreeSet<String>, admins: BTreeSet<String>) -> Self {
+    pub fn new(
+        allowed_clients: BTreeSet<String>,
+        admins: BTreeSet<String>,
+        prf_clients: BTreeSet<String>,
+    ) -> Self {
         Self {
             allowed_clients: Arc::new(allowed_clients),
             admins: Arc::new(admins),
+            prf_clients: Arc::new(prf_clients),
         }
     }
 
@@ -104,13 +141,18 @@ impl IdentityPolicy {
     ///
     /// Admin is checked first so an identity on both lists is treated as admin.
     /// If the client allow-list is empty, every peer is at least a `Client`
-    /// (back-compat); the admin list is always enforced explicitly.
+    /// (back-compat); the admin list is always enforced explicitly. The PRF
+    /// list admits otherwise-unlisted identities with the restricted `Prf`
+    /// role, and sets `prf_allowed` on any admitted identity whose candidates
+    /// match it — the ONLY way `prf_allowed` becomes true.
     pub fn classify(&self, candidates: &[String]) -> Option<ClientIdentity> {
+        let prf_allowed = candidates.iter().any(|c| self.prf_clients.contains(c));
         let admin_match = candidates.iter().find(|c| self.admins.contains(*c));
         if let Some(name) = admin_match {
             return Some(ClientIdentity {
                 name: name.clone(),
                 role: Role::Admin,
+                prf_allowed,
             });
         }
         if self.allowed_clients.is_empty() {
@@ -123,15 +165,34 @@ impl IdentityPolicy {
             return Some(ClientIdentity {
                 name,
                 role: Role::Client,
+                prf_allowed,
             });
         }
-        let client_match = candidates
+        if let Some(name) = candidates
             .iter()
-            .find(|c| self.allowed_clients.contains(*c));
-        client_match.map(|name| ClientIdentity {
-            name: name.clone(),
-            role: Role::Client,
-        })
+            .find(|c| self.allowed_clients.contains(*c))
+        {
+            return Some(ClientIdentity {
+                name: name.clone(),
+                role: Role::Client,
+                prf_allowed,
+            });
+        }
+        // Not on the client list: admit with the restricted Prf role iff on
+        // the PRF list (per-route gates take it from here).
+        if prf_allowed {
+            let name = candidates
+                .iter()
+                .find(|c| self.prf_clients.contains(*c))
+                .cloned()
+                .unwrap_or_else(|| "<unnamed-prf-client>".to_string());
+            return Some(ClientIdentity {
+                name,
+                role: Role::Prf,
+                prf_allowed,
+            });
+        }
+        None
     }
 }
 
@@ -330,9 +391,14 @@ mod tests {
     use super::*;
 
     fn policy(clients: &[&str], admins: &[&str]) -> IdentityPolicy {
+        policy_with_prf(clients, admins, &[])
+    }
+
+    fn policy_with_prf(clients: &[&str], admins: &[&str], prf: &[&str]) -> IdentityPolicy {
         IdentityPolicy::new(
             clients.iter().map(|s| s.to_string()).collect(),
             admins.iter().map(|s| s.to_string()).collect(),
+            prf.iter().map(|s| s.to_string()).collect(),
         )
     }
 
@@ -386,6 +452,48 @@ mod tests {
         // Even the configured client cannot reach admin.
         let id = p.classify(&["freedink".to_string()]).unwrap();
         assert!(!id.is_admin());
+    }
+
+    #[test]
+    fn prf_allowed_comes_only_from_the_prf_list() {
+        // The open back-compat client list must NEVER grant PRF access.
+        let p = policy_with_prf(&[], &[], &["minister"]);
+        let open = p.classify(&["whoever".to_string()]).unwrap();
+        assert_eq!(open.role, Role::Client);
+        assert!(!open.may_prf(), "open client list must not grant PRF");
+        // A configured client off the PRF list gets no PRF either.
+        let p = policy_with_prf(&["freedink"], &[], &["minister"]);
+        let c = p.classify(&["freedink".to_string()]).unwrap();
+        assert!(c.may_sign());
+        assert!(!c.may_prf());
+        // The PRF-listed identity is PRF-allowed.
+        let m = p.classify(&["minister".to_string()]).unwrap();
+        assert!(m.may_prf());
+    }
+
+    #[test]
+    fn prf_only_identity_gets_restricted_role() {
+        // With a configured client list, a PRF-only identity is admitted with
+        // the Prf role: it may reach /prf but NOT the blind-RSA surface.
+        let p = policy_with_prf(&["freedink"], &[], &["minister"]);
+        let m = p.classify(&["minister".to_string()]).unwrap();
+        assert_eq!(m.role, Role::Prf);
+        assert_eq!(m.name, "minister");
+        assert!(m.may_prf());
+        assert!(!m.may_sign());
+        assert!(!m.is_admin());
+        // An identity on BOTH lists keeps full client access plus PRF.
+        let p = policy_with_prf(&["freedink", "minister"], &[], &["minister"]);
+        let m = p.classify(&["minister".to_string()]).unwrap();
+        assert_eq!(m.role, Role::Client);
+        assert!(m.may_prf());
+        assert!(m.may_sign());
+    }
+
+    #[test]
+    fn unlisted_identity_still_rejected_with_prf_list_configured() {
+        let p = policy_with_prf(&["freedink"], &[], &["minister"]);
+        assert!(p.classify(&["intruder".to_string()]).is_none());
     }
 
     #[tokio::test]
@@ -450,7 +558,7 @@ mod tests {
 
         let acceptor = IdentityAcceptor::new(
             Arc::new(config),
-            IdentityPolicy::new(BTreeSet::new(), BTreeSet::new()),
+            IdentityPolicy::new(BTreeSet::new(), BTreeSet::new(), BTreeSet::new()),
         )
         .with_handshake_timeout(Duration::from_millis(100));
 
