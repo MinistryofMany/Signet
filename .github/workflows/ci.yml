@@ -65,5 +65,13 @@ jobs:
       # exact @cloudflare/blindrsa-ts FreedInk uses, and cross-version / metadata
       # mismatches must be rejected. Builds the interop_tool example, installs the
       # pinned TS lib, and runs the driver; prints INTEROP OK on success.
-      - name: Run interop harness
+      - name: Run blind-RSA interop harness
         run: bash interop/run.sh
+      # VOPRF suite decision gate (ADR Phase 2 item 6): TS (@cloudflare/voprf-ts
+      # + noble) blind -> Rust evaluate + DLEQ -> TS finalize (DLEQ verified
+      # against the pinned pkS) -> byte-compare against the frozen ecosystem
+      # vectors; tampered-proof and wrong-key evaluations must be rejected.
+      # Red here means flip the ciphersuite to P256-SHA256 before anything
+      # depends on values. Prints PRF INTEROP OK on success.
+      - name: Run PRF (VOPRF) interop harness
+        run: bash interop/run-prf.sh
