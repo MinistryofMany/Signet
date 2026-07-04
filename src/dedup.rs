@@ -23,7 +23,9 @@
 //! - **One-shot pairwise import.** `SIGNET_IMPORT_PAIRWISE_HMAC` is consumed
 //!   at config load (zeroize + remove_var, the SIGNET_KEK pattern) and sealed
 //!   here on first boot; a second import while a sealed copy exists refuses
-//!   startup rather than silently overwriting.
+//!   startup rather than silently overwriting. The seal runs only AFTER every
+//!   other boot validation (pin check included) passes: a refusing boot never
+//!   persists the imported secret as a side effect.
 
 use crate::db::Db;
 use crate::keystore::Kek;
@@ -145,8 +147,12 @@ pub fn prepare_prf_boot(db: &Db, kek: &Kek, args: PrfBootArgs<'_>) -> Result<Prf
             let mut seed = Zeroizing::new([0u8; MASTER_SEED_LEN]);
             seed.copy_from_slice(&seed_bytes);
 
-            // Pairwise secret: import once, or load the sealed copy.
-            let pairwise = match args.import_pairwise {
+            // Pairwise secret: resolve the bytes WITHOUT persisting anything.
+            // A boot that ultimately refuses (e.g. a pin mismatch on a forked
+            // or wrong node) must not leave a sealed copy of the imported
+            // secret on that node's disk as a side effect, so the one-shot
+            // import is sealed only AFTER every boot validation passes.
+            let (pairwise, importing) = match args.import_pairwise {
                 Some(secret) => {
                     if db.get_service_key(PAIRWISE_HMAC_PURPOSE)?.is_some() {
                         return Err(
@@ -156,27 +162,25 @@ pub fn prepare_prf_boot(db: &Db, kek: &Kek, args: PrfBootArgs<'_>) -> Result<Prf
                                 .to_string(),
                         );
                     }
-                    let sealed_pw = kek.seal(PAIRWISE_HMAC_PURPOSE, SERVICE_KEY_ID, &secret)?;
-                    if !db.insert_service_key(PAIRWISE_HMAC_PURPOSE, &sealed_pw)? {
-                        return Err("pairwise secret import raced a concurrent insert; refusing"
-                            .to_string());
-                    }
-                    tracing::info!(
-                        "imported the pairwise HMAC secret into service_keys (env consumed)"
-                    );
-                    Some(secret)
+                    (Some(secret), true)
                 }
                 None => match db.get_service_key(PAIRWISE_HMAC_PURPOSE)? {
-                    Some(sealed_pw) => Some(Zeroizing::new(kek.open(
-                        PAIRWISE_HMAC_PURPOSE,
-                        SERVICE_KEY_ID,
-                        &sealed_pw,
-                    )?)),
-                    None => None,
+                    Some(sealed_pw) => (
+                        Some(Zeroizing::new(kek.open(
+                            PAIRWISE_HMAC_PURPOSE,
+                            SERVICE_KEY_ID,
+                            &sealed_pw,
+                        )?)),
+                        false,
+                    ),
+                    None => (None, false),
                 },
             };
 
-            let keys = PrfKeys::from_seed(*seed, pairwise)?;
+            let keys = PrfKeys::from_seed(
+                *seed,
+                pairwise.as_ref().map(|s| Zeroizing::new(s.to_vec())),
+            )?;
             let derived = keys.public_key_b64();
             if derived != pin {
                 // Both values are public keys — safe to surface for ops.
@@ -185,6 +189,20 @@ pub fn prepare_prf_boot(db: &Db, kek: &Kek, args: PrfBootArgs<'_>) -> Result<Prf
                      {pin}; refusing to start (key-fork guard: this node's sealed seed is not \
                      the pinned one)"
                 ));
+            }
+
+            // All boot validations passed — only now persist a first-boot import.
+            if importing {
+                let secret = pairwise.expect("importing implies the secret bytes are present");
+                let sealed_pw = kek.seal(PAIRWISE_HMAC_PURPOSE, SERVICE_KEY_ID, &secret)?;
+                if !db.insert_service_key(PAIRWISE_HMAC_PURPOSE, &sealed_pw)? {
+                    return Err(
+                        "pairwise secret import raced a concurrent insert; refusing".to_string()
+                    );
+                }
+                tracing::info!(
+                    "imported the pairwise HMAC secret into service_keys (env consumed)"
+                );
             }
             Ok(PrfBoot::Enabled(Box::new(keys)))
         }
@@ -316,6 +334,39 @@ mod tests {
         };
         assert!(keys.has_pairwise());
         assert_eq!(keys.pairwise(b"probe").unwrap(), out_first);
+    }
+
+    #[test]
+    fn pin_mismatch_boot_does_not_seal_the_pairwise_import() {
+        let db = Db::open_in_memory().unwrap();
+        let kek = test_kek();
+        let pk = init_service_keys(&db, &kek).unwrap();
+        let secret = b"live-pairwise-secret-bytes";
+
+        // Boot with the import env set but a MISMATCHED pin (wrong/forked
+        // node): must refuse AND must not have persisted the secret.
+        let err = boot_err(
+            &db,
+            &kek,
+            args(
+                true,
+                Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+                Some(secret),
+            ),
+        );
+        assert!(err.contains("does not match"), "{err}");
+        assert!(
+            db.get_service_key(PAIRWISE_HMAC_PURPOSE).unwrap().is_none(),
+            "a refusing boot must not leave a sealed pairwise secret behind"
+        );
+
+        // A corrected boot with the import STILL set now succeeds (the fix
+        // means the failed attempt did not consume the one-shot import).
+        let keys = match prepare_prf_boot(&db, &kek, args(true, Some(&pk), Some(secret))).unwrap() {
+            PrfBoot::Enabled(keys) => keys,
+            PrfBoot::Disabled => panic!("must be enabled"),
+        };
+        assert!(keys.has_pairwise());
     }
 
     #[test]
