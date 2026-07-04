@@ -7,6 +7,7 @@
 pub mod config;
 pub mod crypto;
 pub mod db;
+pub mod dedup;
 pub mod error;
 pub mod handlers;
 pub mod identity;
