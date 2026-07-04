@@ -23,7 +23,22 @@
 //! pairwise secret. Instead every identity carries a `prf_allowed` flag,
 //! matched ONLY against the dedicated `SIGNET_PRF_CLIENT_IDS` set, and every
 //! `/prf/*` / `/dedup/*` handler checks it per-route (mirroring the
-//! `is_admin()` gate on `/key/rotate`) — fail-closed at both layers.
+//! `is_admin()` gate on `/key/rotate`), where the pinned identity NAME is
+//! additionally re-checked against the same set — fail-closed at both layers.
+//!
+//! CA ISSUANCE DISCIPLINE (load-bearing for the PRF allow-list): the
+//! candidate names cover the leaf CN plus EVERY DNS SAN, so a certificate
+//! signed from a CSR-supplied name set could smuggle a PRF identity (e.g. a
+//! dNSName "minister") onto an RP certificate and silently grant it the full
+//! PRF surface, including the pairwise HMAC oracle. The Signet client CA
+//! must therefore issue client certificates with operator-fixed CN/SAN only
+//! — never sign CSR-supplied subject names or SANs verbatim — and PRF
+//! identities should use names no RP certificate would legitimately carry
+//! (a dedicated prefix such as `prf-` makes a collision visually
+//! impossible). The in-handler name re-check narrows the blast radius of a
+//! sloppy issuance (the pinned name must itself be PRF-listed) but does not
+//! remove it: a cert whose FIRST candidate is the smuggled name still pins
+//! it. Issuance discipline is the actual boundary.
 //!
 //! Enforcement happens in two places:
 //!   1. **Connection admission** (`IdentityAcceptor`): when an allow-list is
