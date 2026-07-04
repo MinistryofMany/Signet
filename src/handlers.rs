@@ -488,6 +488,21 @@ fn require_prf<'a>(state: &'a AppState, identity: &ClientIdentity) -> AppResult<
     }
 }
 
+/// Run blocking dedup-ledger DB work off the async runtime (the `/sign`
+/// convention, see [`sign`]): the single write-serialized SQLite connection
+/// is shared with the blind-RSA surface, so ledger queries and transactions
+/// must not occupy tokio worker threads or add tail latency to `/sign`.
+async fn run_db_blocking<T, F>(f: F) -> AppResult<T>
+where
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| AppError::Internal(format!("join error: {e}")))?
+        .map_err(AppError::Internal)
+}
+
 /// Decode a base64url-no-pad field, strictly. Failure is always a 400.
 fn b64url_decode(value: &str, err: &'static str) -> AppResult<Vec<u8>> {
     B64URL
@@ -653,10 +668,9 @@ pub async fn prf_disclose(
         MAX_CLIENT_ID_LEN,
         "client_id length out of range",
     )?;
-    let entry = state
-        .db
-        .dedup_entry_by_ref(&entry_ref)
-        .map_err(AppError::Internal)?
+    let db = state.db.clone();
+    let entry = run_db_blocking(move || db.dedup_entry_by_ref(&entry_ref))
+        .await?
         .ok_or(AppError::NotFound("no such dedup entry"))?;
     if !db::owner_eq(&entry.owner_tag, &req.owner_handle) {
         tracing::warn!(
@@ -726,10 +740,11 @@ pub async fn dedup_register(
         .try_fill_bytes(&mut entry_ref)
         .map_err(|e| AppError::Internal(format!("OS RNG failure: {e}")))?;
 
-    let outcome = state
-        .db
-        .register_dedup(&entry_ref, &value, &req.owner_handle, &req.badge_type)
-        .map_err(AppError::Internal)?;
+    let db = state.db.clone();
+    let outcome = run_db_blocking(move || {
+        db.register_dedup(&entry_ref, &value, &req.owner_handle, &req.badge_type)
+    })
+    .await?;
     // Logged uniformly for every outcome (registered / already_yours / taken):
     // the outcome goes only to the caller, never to the log stream.
     tracing::info!(identity = %identity.name, endpoint = "dedup/register", "served");
@@ -770,10 +785,9 @@ pub async fn dedup_release(
         MAX_OWNER_HANDLE_LEN,
         "owner_handle length out of range",
     )?;
-    let outcome = state
-        .db
-        .release_dedup(&entry_ref, &req.owner_handle)
-        .map_err(AppError::Internal)?;
+    let db = state.db.clone();
+    let outcome =
+        run_db_blocking(move || db.release_dedup(&entry_ref, &req.owner_handle)).await?;
     // Uniform, outcome-free log line (see the module doc).
     tracing::info!(identity = %identity.name, endpoint = "dedup/release", "served");
     let status = match outcome {
@@ -837,10 +851,11 @@ pub async fn dedup_reassign(
     if req.from_owner_handle == req.to_owner_handle {
         return Err(AppError::BadRequest("from and to owner handles are equal"));
     }
-    let outcome = state
-        .db
-        .reassign_dedup(&refs, &req.from_owner_handle, &req.to_owner_handle)
-        .map_err(AppError::Internal)?;
+    let db = state.db.clone();
+    let outcome = run_db_blocking(move || {
+        db.reassign_dedup(&refs, &req.from_owner_handle, &req.to_owner_handle)
+    })
+    .await?;
     let moved = match outcome {
         DedupReassign::Reassigned { moved } => moved,
         DedupReassign::NotFound => {
