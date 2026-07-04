@@ -23,6 +23,19 @@ path = "src/main.rs"
 # Interop-proven against @cloudflare/blindrsa-ts RSAPBSSA.SHA384.PSS.Randomized.
 blind-rsa-signatures = "=0.17.2"
 
+# PRF surface (disjoint from the blind-RSA surface): RFC 9497 VOPRF, mode 0x01,
+# ciphersuite ristretto255-SHA512 (curve25519-dalek backend). Interop-proven
+# against @cloudflare/voprf-ts (see interop/prf.mjs). Crypto deps pinned exact.
+voprf = { version = "=0.5.0", default-features = false, features = ["ristretto255-ciphersuite", "std"] }
+# Nullifier key schedule (HKDF-SHA512) and stage-2 / pairwise HMAC-SHA256.
+hkdf = "=0.12.4"
+hmac = "=0.12.1"
+sha2 = "=0.10.9"
+# rand_core 0.6 OsRng for voprf's blind_evaluate: voprf 0.5 consumes rand_core
+# 0.6 RNG traits, which the crate's own `rand` 0.9 (rand_core 0.9) does not
+# implement.
+rand_core = { version = "=0.6.4", features = ["getrandom"] }
+
 # HTTP + TLS
 axum = { version = "0.8", default-features = false, features = ["json", "tokio", "http1", "query"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
@@ -60,6 +73,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-manual-roots"] }
 tempfile = "3"
 rcgen = "0.13"
+# `danger` exposes deterministic_blind_unchecked, needed ONLY to drive the
+# RFC 9497 Appendix A test vectors (fixed blinds). Dev-only: the release
+# binary is built without dev-dependency feature unification.
+voprf = { version = "=0.5.0", default-features = false, features = ["ristretto255-ciphersuite", "std", "danger"] }
 
 [profile.release]
 opt-level = 3

@@ -1,0 +1,39 @@
+{
+  "comment": "Minister-ecosystem frozen PRF vectors. Cross-repo byte-equality fixtures: Signet's unit tests (src/prf.rs), the cross-language interop harness (interop/prf.mjs), and Minister's CI fixture job all assert these exact bytes. Value-stable FOREVER — a change here means the nullifier construction drifted. The master seed is a TEST fixture, never a production key.",
+  "suite": "ristretto255-SHA512",
+  "voprf_mode": 1,
+  "master_seed_hex": "4d494e49535445522d544553542d564543544f522d534545442d303030312121",
+  "public_key_b64url": "8uMuBaBUTsZb-btCd6BMV_NdqYdyXqOkoh5NepCesAg",
+  "dedup": {
+    "sybil_id": "gh:1234567",
+    "badge_type": "oauth-account",
+    "input_hex": "00106d696e69737465722f6e756c6c2f763100056465647570000a67683a31323334353637000d6f617574682d6163636f756e74",
+    "n_dedup_hex": "bf13858616d54fc8d0268cc46a7998d60f12e6e15b2c6f17d63e708a5a2b937e65eee45487732818e9542260afb7e7abb3deaab5a021a44d0b03e76b37bb2a21"
+  },
+  "disclose": {
+    "client_id": "mc_golden_client_0001",
+    "n_rp": "mnv1:b1Er88B8RZaAeBIMLBpKCBfk7zuF5O3JZv75aSZQbmI"
+  },
+  "pairwise": {
+    "comment": "Minister Phase 0 golden pairwise vectors, frozen in Minister's oidc-claims.pairwise.test.ts. output = base64url(HMAC-SHA256(secret, input)), no padding.",
+    "secret_utf8": "minister-golden-vector-secret-v1-do-not-change!!",
+    "vectors": [
+      {
+        "input": "user_golden_0001:mc_golden_client_0001",
+        "output": "xOfT05jnZI0r8hweyDLf7GnlAlPoUhHHoUsKH49Olm0"
+      },
+      {
+        "input": "jti:badge_golden_0001:mc_golden_client_0001",
+        "output": "5fIc0YcinsYRBEf1J6aZXcoKuxmDStXGch6Rk_bDylM"
+      },
+      {
+        "input": "sharelink:user_golden_0001:share_golden_0001",
+        "output": "3Wfr4iEXijtFDIQ9JkYamk6r427jpcY4ApbNbShi9sY"
+      },
+      {
+        "input": "jti:sharelink:badge_golden_0001:share_golden_0001",
+        "output": "8ITdmHQXFlAukLUGdhAOqexFVwIEbnQFKvOnHy3LoOo"
+      }
+    ]
+  }
+}

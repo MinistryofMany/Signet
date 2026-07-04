@@ -12,6 +12,7 @@ pub mod handlers;
 pub mod identity;
 pub mod keygen;
 pub mod keystore;
+pub mod prf;
 pub mod ratelimit;
 pub mod state;
 pub mod tls;
