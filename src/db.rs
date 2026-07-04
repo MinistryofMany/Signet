@@ -597,6 +597,15 @@ where
     )
     .map_err(|e| e.to_string())?;
     let key_id = tx.last_insert_rowid();
+    // AAD domain-separation invariant: group keys must never seal under
+    // key_id 0, which is reserved for the service_keys AAD (see
+    // dedup::SERVICE_KEY_ID). SQLite rowids start at 1, so this can only
+    // fire on a corrupted table — fail closed rather than seal ambiguously.
+    if key_id < 1 {
+        return Err(format!(
+            "group key rowid {key_id} violates the key_id >= 1 invariant"
+        ));
+    }
     let sealed = seal(key_id)?;
     let updated = tx
         .execute(

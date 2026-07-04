@@ -36,6 +36,14 @@ use zeroize::Zeroizing;
 /// AAD key-id used when sealing service keys. There is exactly one row per
 /// purpose; the purpose string is the AAD group identity, so a sealed blob
 /// cannot be replayed under a different purpose.
+///
+/// DOMAIN-SEPARATION INVARIANT (load-bearing): service keys always seal with
+/// key-id 0, while group keys seal under their `group_keys.key_id` rowid,
+/// which SQLite assigns starting at 1 (checked in
+/// `db::insert_active_key_resealed`). `group_id` is client-chosen free text
+/// (a group literally named "master-seed-v1" is legal), so the 0-vs-≥1
+/// key-id split — not the purpose string — is what makes a cross-table blob
+/// swap fail AES-GCM authentication.
 const SERVICE_KEY_ID: i64 = 0;
 
 /// Guard for the one-shot init mode, run BEFORE anything is minted. Minting

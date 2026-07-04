@@ -90,6 +90,13 @@ impl Kek {
     }
 }
 
+/// AAD encoding for a sealed blob. Group keys bind `(group_id, key_id)` with
+/// the AUTOINCREMENT rowid (>= 1); service keys bind `(purpose, 0)` through
+/// the same encoding. Because `group_id` is client-chosen free text, the
+/// key-id domain split (0 = service keys, >= 1 = group keys) is the
+/// structural separator between the two tables — see
+/// `dedup::SERVICE_KEY_ID` and the invariant check in
+/// `db::insert_active_key_resealed`.
 fn associated_data(group_id: &str, key_id: i64) -> Vec<u8> {
     let mut aad = Vec::with_capacity(group_id.len() + 8);
     aad.extend_from_slice(group_id.as_bytes());

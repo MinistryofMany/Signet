@@ -166,6 +166,28 @@ async fn service_keys_are_ciphertext_at_rest() {
         );
     }
 
+    // Raw-file scan: the secret bytes must appear nowhere in the database
+    // file OR its WAL (not just in the service_keys rows the query above
+    // selected) — a partial page copy or another table leaking the material
+    // would be caught here.
+    let mut file_bytes = std::fs::read(&server.db_path).unwrap();
+    let wal_path = server.db_path.with_extension("db-wal");
+    if let Ok(mut wal_bytes) = std::fs::read(&wal_path) {
+        file_bytes.append(&mut wal_bytes);
+    }
+    assert!(!file_bytes.is_empty(), "expected raw DB bytes to scan");
+    for (what, needle) in [
+        ("master seed", &seed[..]),
+        ("master seed prefix", &seed[..16]),
+        ("pairwise secret", &pairwise[..]),
+        ("pairwise secret prefix", &pairwise[..16]),
+    ] {
+        assert!(
+            !contains(&file_bytes, needle),
+            "raw DB file (incl. WAL) contains the plaintext {what}"
+        );
+    }
+
     // Control: the check is meaningful — the seed does contain its own prefix.
     assert!(contains(&seed, &seed[..16]));
 }
