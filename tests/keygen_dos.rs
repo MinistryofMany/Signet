@@ -25,8 +25,16 @@ use std::time::Duration;
 const FAST_BITS: usize = 1024;
 
 /// Poll `GET /key` until ready (200) or timeout. Returns the final status code.
+///
+/// The ceiling (3600 x 100ms ~ 360s) matches the other integration suites
+/// (at_rest, issuance): safe-prime keygen is high-variance, the binary runs its
+/// tests in parallel, and shared CI runners are slow, so many concurrent
+/// keygens contending for a few vCPUs can legitimately take minutes. The poll
+/// exits as soon as the key is ready, so the ceiling costs nothing on a healthy
+/// run. The DoS bound is asserted by the immediate 200/202 responses, not by
+/// this eventual-readiness poll, so a generous ceiling weakens nothing.
 async fn poll_until_ready(client: &reqwest::Client, base: &str, group: &str) -> bool {
-    for _ in 0..600 {
+    for _ in 0..3600 {
         let res = client
             .get(format!("{base}/key?group_id={group}"))
             .send()
@@ -37,7 +45,7 @@ async fn poll_until_ready(client: &reqwest::Client, base: &str, group: &str) -> 
             assert_eq!(body["status"], "ready");
             return true;
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
     false
 }

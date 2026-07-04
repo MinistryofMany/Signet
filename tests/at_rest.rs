@@ -37,9 +37,11 @@ async fn private_key_is_ciphertext_at_rest() {
             res.status() == 202 || res.status() == 200,
             "POST /key should enqueue (202) or be already-ready (200)"
         );
-        // Poll until ready (generous ceiling for slow release keygen).
+        // Poll until ready. Ceiling 3600 x 100ms ~ 360s: 2048-bit safe-prime
+        // keygen is high-variance and a single key has taken ~50s on a slow
+        // shared CI runner; the poll exits as soon as the key is ready.
         let mut ready = false;
-        for _ in 0..1200 {
+        for _ in 0..3600 {
             let res = client
                 .get(format!("{base}/key?group_id={g}"))
                 .send()

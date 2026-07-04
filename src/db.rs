@@ -441,7 +441,10 @@ mod tests {
         let r = db.rotate_key_sealed("g1", b"spki-2", |_id| Err("seal boom".to_string()));
         assert!(r.is_err());
 
-        let after = db.active_key("g1").unwrap().expect("original key still active");
+        let after = db
+            .active_key("g1")
+            .unwrap()
+            .expect("original key still active");
         assert_eq!(after.key_id, before.key_id, "the original key stays active");
         let opened = kek.open("g1", after.key_id, &after.sealed_pkcs8).unwrap();
         assert_eq!(opened, b"secret-1");
