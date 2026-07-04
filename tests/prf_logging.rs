@@ -96,6 +96,15 @@ async fn prf_logs_carry_identity_and_endpoint_but_never_payloads() {
         .unwrap()
         .to_string();
 
+    // already_yours re-register: its log line must carry no outcome status.
+    let res = client
+        .post(format!("{base}/dedup/register"))
+        .json(&json!({ "value": value_b64, "owner_handle": owner_a, "badge_type": "email-domain" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+
     // Failure paths (owner mismatch + taken + authz refusal) — the warn/info
     // lines they emit must be payload-free too.
     let res = client
@@ -120,6 +129,18 @@ async fn prf_logs_carry_identity_and_endpoint_but_never_payloads() {
         .await
         .unwrap();
     assert_eq!(res.status(), 403);
+
+    // Release + idempotent retry (released / already_released outcomes) — run
+    // last so the entry_ref stays live for the paths above.
+    for _ in 0..2 {
+        let res = client
+            .post(format!("{base}/dedup/release"))
+            .json(&json!({ "entry_ref": entry_ref, "owner_handle": owner_a }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+    }
 
     let logs = String::from_utf8_lossy(&buf.0.lock().unwrap()).to_string();
 
@@ -151,4 +172,14 @@ async fn prf_logs_carry_identity_and_endpoint_but_never_payloads() {
     }
     // Hex spellings of the dedup value must not appear either.
     assert!(!logs.contains(&hex::encode(value_bytes)));
+
+    // Per-request OUTCOME status must not appear: a log reader must not be
+    // able to see credential-collision events ("taken") or distinguish
+    // registered/already_yours/released/already_released from the stream.
+    for outcome in ["status=", "taken", "already_yours", "already_released"] {
+        assert!(
+            !logs.contains(outcome),
+            "outcome marker {outcome:?} leaked into the logs"
+        );
+    }
 }

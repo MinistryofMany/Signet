@@ -21,7 +21,11 @@
 //! returns the blind signature. It never logs the blinded message or the
 //! signature. The audit log records only (group_id, participant_id, version_id).
 //! The PRF surface goes further: its logs record ONLY the pinned identity and
-//! the endpoint — never inputs, outputs, values, handles, or refs.
+//! the endpoint — never inputs, outputs, values, handles, refs, or per-request
+//! outcome status (an outcome like a dedup collision is visible only to the
+//! caller; logging it would make credential-collision events readable and
+//! timestamp-correlatable from the log stream). Authorization refusals emit a
+//! payload-free warning.
 //!
 //! ASYNC KEYGEN (audit H1): safe-prime keygen is multi-second, so key creation
 //! never blocks a request thread. `POST /key` and the auto-create path of
@@ -726,15 +730,14 @@ pub async fn dedup_register(
         .db
         .register_dedup(&entry_ref, &value, &req.owner_handle, &req.badge_type)
         .map_err(AppError::Internal)?;
+    // Logged uniformly for every outcome (registered / already_yours / taken):
+    // the outcome goes only to the caller, never to the log stream.
+    tracing::info!(identity = %identity.name, endpoint = "dedup/register", "served");
     let (status, entry_ref) = match outcome {
         DedupRegister::Registered { entry_ref } => ("registered", entry_ref),
         DedupRegister::AlreadyYours { entry_ref } => ("already_yours", entry_ref),
-        DedupRegister::Taken => {
-            tracing::info!(identity = %identity.name, endpoint = "dedup/register", "taken");
-            return Err(AppError::DedupTaken);
-        }
+        DedupRegister::Taken => return Err(AppError::DedupTaken),
     };
-    tracing::info!(identity = %identity.name, endpoint = "dedup/register", status, "served");
     Ok(Json(RegisterResponse {
         status,
         entry_ref: B64URL.encode(entry_ref),
@@ -771,6 +774,8 @@ pub async fn dedup_release(
         .db
         .release_dedup(&entry_ref, &req.owner_handle)
         .map_err(AppError::Internal)?;
+    // Uniform, outcome-free log line (see the module doc).
+    tracing::info!(identity = %identity.name, endpoint = "dedup/release", "served");
     let status = match outcome {
         DedupRelease::Released => "released",
         DedupRelease::NotFound => "already_released",
@@ -785,7 +790,6 @@ pub async fn dedup_release(
             ));
         }
     };
-    tracing::info!(identity = %identity.name, endpoint = "dedup/release", status, "served");
     Ok(Json(ReleaseResponse { status }))
 }
 
