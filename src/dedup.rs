@@ -38,6 +38,44 @@ use zeroize::Zeroizing;
 /// cannot be replayed under a different purpose.
 const SERVICE_KEY_ID: i64 = 0;
 
+/// Guard for the one-shot init mode, run BEFORE anything is minted. Minting
+/// must be structurally impossible on a node that is configured to belong to
+/// an existing keyspace:
+///
+/// - `SIGNET_DEDUP_PUBKEY_PIN` set → the pinned seed already exists somewhere
+///   by definition, so this node must restore its keystore, never initialize.
+///   This closes the operator-error fork: a stray `SIGNET_INIT_SERVICE_KEYS=1`
+///   left in a persistent unit env can no longer mint a fresh seed on a
+///   replica that boots before its keystore restore completes.
+/// - `SIGNET_IMPORT_PAIRWISE_HMAC` set → the import is consumed at ordinary
+///   boot after all boot validations pass; on an init invocation it would be
+///   silently ignored, so refuse loudly instead (the caller must still
+///   consume/zeroize the variable before calling this).
+pub fn check_init_preconditions(
+    pin_configured: bool,
+    import_configured: bool,
+) -> Result<(), String> {
+    if pin_configured {
+        return Err(
+            "SIGNET_DEDUP_PUBKEY_PIN is set; refusing to initialize service keys. A pinned \
+             node's master seed already exists elsewhere by definition (key-fork guard): \
+             restore the keystore instead. Run the one deliberate first-time init without \
+             the pin, then pin the printed public key"
+                .to_string(),
+        );
+    }
+    if import_configured {
+        return Err(
+            "SIGNET_IMPORT_PAIRWISE_HMAC is set on an init invocation; refusing (the \
+             variable has been consumed and removed from the environment). The pairwise \
+             import is sealed on the first ORDINARY boot after validations pass — run \
+             init without it, then boot once with the import variable set"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// One-shot service-key initialization. Mints a fresh 32-byte master seed
 /// from OS randomness, seals it into `service_keys`, and returns the derived
 /// public key `pkS` in the pin encoding (base64url, no padding). Refuses if
@@ -113,6 +151,15 @@ pub fn prepare_prf_boot(db: &Db, kek: &Kek, args: PrfBootArgs<'_>) -> Result<Prf
                     "SIGNET_IMPORT_PAIRWISE_HMAC is set but the PRF surface is not enabled \
                      (no service keys, no SIGNET_PRF_CLIENT_IDS); refusing to start rather \
                      than sealing a secret into a surface that is not configured"
+                        .to_string(),
+                );
+            }
+            if args.dedup_pubkey_pin.is_some() {
+                return Err(
+                    "SIGNET_DEDUP_PUBKEY_PIN is set but the PRF surface is not configured \
+                     (no service keys, no SIGNET_PRF_CLIENT_IDS); refusing to start rather \
+                     than silently ignoring a pinned key (config slip: set \
+                     SIGNET_PRF_CLIENT_IDS and restore the keystore, or unset the pin)"
                         .to_string(),
                 );
             }
@@ -374,5 +421,29 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let err = boot_err(&db, &test_kek(), args(false, None, Some(b"secret")));
         assert!(err.contains("not enabled"), "{err}");
+    }
+
+    #[test]
+    fn boot_refuses_orphaned_pubkey_pin() {
+        // A pin with no keys and no PRF allow-list is a config slip (e.g. the
+        // allow-list was forgotten); refuse rather than silently mounting
+        // nothing while the operator believes the surface is pinned.
+        let db = Db::open_in_memory().unwrap();
+        let err = boot_err(&db, &test_kek(), args(false, Some("some-pin"), None));
+        assert!(err.contains("SIGNET_DEDUP_PUBKEY_PIN is set"), "{err}");
+    }
+
+    #[test]
+    fn init_refuses_on_a_pinned_or_importing_node() {
+        // A pinned node must NEVER mint: its seed exists elsewhere by
+        // definition.
+        let err = check_init_preconditions(true, false).unwrap_err();
+        assert!(err.contains("refusing to initialize"), "{err}");
+        // An init invocation carrying the pairwise import refuses loudly
+        // instead of silently ignoring the secret.
+        let err = check_init_preconditions(false, true).unwrap_err();
+        assert!(err.contains("init invocation"), "{err}");
+        // The deliberate first-time init (no pin, no import) proceeds.
+        assert!(check_init_preconditions(false, false).is_ok());
     }
 }

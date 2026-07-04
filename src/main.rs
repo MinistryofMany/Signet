@@ -75,8 +75,19 @@ fn is_init_mode() -> bool {
 /// on stdout — and ONLY `pkS`, never seed bytes — then exit. The operator
 /// pins the printed value as `SIGNET_DEDUP_PUBKEY_PIN` (and Minister's
 /// `MINISTER_SIGNET_DEDUP_PUBKEY`).
+///
+/// Guarded: a node configured with a pubkey pin (its seed exists elsewhere by
+/// definition) or a pairwise import must NEVER mint — see
+/// [`dedup::check_init_preconditions`]. This closes the fork where a stray
+/// `SIGNET_INIT_SERVICE_KEYS=1` in a persistent unit env mints a fresh seed
+/// on a replica racing its keystore restore.
 fn run_init_service_keys() {
     let result = (|| -> Result<String, String> {
+        let pin_configured = std::env::var("SIGNET_DEDUP_PUBKEY_PIN").is_ok();
+        // Consume (zeroize + remove) the import variable BEFORE refusing on
+        // it, so the secret does not linger in the runtime environment.
+        let import = config::consume_pairwise_import_env();
+        dedup::check_init_preconditions(pin_configured, import.is_some())?;
         let kek = config::consume_kek_env()?;
         let db_path = config::db_path_from_env()?;
         let db = Db::open(&db_path)?;

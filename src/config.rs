@@ -121,8 +121,10 @@ pub fn consume_kek_env() -> Result<Kek, String> {
 /// Consume `SIGNET_IMPORT_PAIRWISE_HMAC` (if set): take the EXACT UTF-8 bytes
 /// (no trimming — byte-stability with Minister's live derivation), remove the
 /// variable from the environment, and return the bytes in a zeroizing buffer.
-/// Same single-threaded-before-runtime requirement as [`consume_kek_env`].
-fn consume_pairwise_import_env() -> Option<Zeroizing<Vec<u8>>> {
+/// Same single-threaded-before-runtime requirement as [`consume_kek_env`],
+/// and the same bounded residual (see that function's note). Public because
+/// the `init-service-keys` one-shot also consumes it (and then refuses).
+pub fn consume_pairwise_import_env() -> Option<Zeroizing<Vec<u8>>> {
     match std::env::var("SIGNET_IMPORT_PAIRWISE_HMAC") {
         Ok(raw) => {
             std::env::remove_var("SIGNET_IMPORT_PAIRWISE_HMAC");
