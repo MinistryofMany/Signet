@@ -14,8 +14,7 @@ use signet::state::AppState;
 use signet::{router, serve, tls};
 use std::sync::Arc;
 
-#[tokio::main]
-async fn main() {
+fn main() {
     tracing_subscriber::fmt()
         .json()
         .with_env_filter(
@@ -24,19 +23,41 @@ async fn main() {
         )
         .init();
 
-    if let Err(e) = run().await {
+    // Parse configuration BEFORE the async runtime exists (audit L1). Config
+    // loading consumes secret environment variables (`SIGNET_KEK`) via
+    // `std::env::remove_var`, which is only sound while the process is still
+    // single-threaded. A `#[tokio::main]` entrypoint would spawn the runtime's
+    // worker threads first and make that env mutation a data race.
+    let cfg = match Config::from_env() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            tracing::error!(error = %e, "fatal");
+            std::process::exit(1);
+        }
+    };
+
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            tracing::error!(error = %e, "fatal: failed to build the tokio runtime");
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(e) = runtime.block_on(run(cfg)) {
         tracing::error!(error = %e, "fatal");
         std::process::exit(1);
     }
 }
 
-async fn run() -> Result<(), String> {
+async fn run(cfg: Config) -> Result<(), String> {
     // Install the ring-based default crypto provider for rustls 0.23.
     rustls::crypto::ring::default_provider()
         .install_default()
         .map_err(|_| "failed to install rustls crypto provider".to_string())?;
-
-    let cfg = Config::from_env()?;
 
     let db = Arc::new(Db::open(&cfg.db_path)?);
     let keygen = KeygenService::new(

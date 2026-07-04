@@ -94,9 +94,10 @@ impl Config {
         // crash dump that walks the environment block. The in-memory `Kek` is
         // the only remaining copy and is itself zeroized on drop.
         //
-        // SAFETY: `remove_var` is sound here because config loading happens once
-        // at startup, before any worker threads that might read the environment
-        // are spawned (see `main::run`), so there is no concurrent env access.
+        // SAFETY: `remove_var` is sound here because `Config::from_env` is
+        // called from `main` BEFORE the tokio runtime is built (audit L1), so
+        // the process is still single-threaded and there is no concurrent env
+        // access. Callers must preserve that ordering.
         std::env::remove_var("SIGNET_KEK");
         let kek = kek_result.map_err(|e| format!("SIGNET_KEK is invalid: {e}"))?;
 
