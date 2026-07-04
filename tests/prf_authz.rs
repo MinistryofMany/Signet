@@ -114,6 +114,42 @@ async fn open_client_list_still_does_not_grant_prf() {
 }
 
 #[tokio::test]
+async fn san_smuggled_prf_grant_with_a_foreign_pinned_name_is_refused() {
+    let pki = make_pki();
+    // OPEN client list: the smuggling cert (CN "sneaky-rp", DNS SAN
+    // "minister") is admitted as a Client and classify pins its CN as the
+    // identity name, while the stray SAN sets the prf_allowed flag. The
+    // in-handler second-layer check must refuse every PRF/dedup route: the
+    // PINNED (audited) name is not itself on SIGNET_PRF_CLIENT_IDS.
+    let server = start_server(
+        &pki,
+        ServerOpts {
+            allowed_client_ids: id_set(&[]),
+            prf: Some(PrfOpts::default()),
+            ..ServerOpts::default()
+        },
+    )
+    .await;
+    let base = base_url(&server);
+    let smuggler = san_smuggle_client(&pki);
+    for (method, path, body) in prf_routes() {
+        assert_eq!(
+            status_for(&smuggler, &base, method, path, &body).await,
+            403,
+            "{path} must be 403 when the pinned name is not the PRF-listed one"
+        );
+    }
+    // The genuine PRF identity (pinned name == PRF-listed name) still passes.
+    let minister = prf_client(&pki);
+    let res = minister
+        .get(format!("{base}/prf/public-key"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+}
+
+#[tokio::test]
 async fn prf_only_identity_is_refused_on_the_blind_rsa_surface() {
     let pki = make_pki();
     let server = start_server(

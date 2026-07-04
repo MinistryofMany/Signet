@@ -49,6 +49,12 @@ pub struct Pki {
     /// PRF client identity: CN "minister".
     pub prf_cert_pem: String,
     pub prf_key_pem: String,
+    /// A cert with an off-list CN but a DNS SAN colliding with the PRF
+    /// identity (CN "sneaky-rp", SAN "minister"): proves the second-layer
+    /// name check refuses a SAN-smuggled PRF grant when the pinned identity
+    /// name came from another list.
+    pub san_smuggle_cert_pem: String,
+    pub san_smuggle_key_pem: String,
 }
 
 /// CN of the default client cert.
@@ -93,6 +99,16 @@ pub fn make_pki() -> Pki {
     let (other_cert_pem, other_key_pem) = mint_client(OTHER_CN);
     let (prf_cert_pem, prf_key_pem) = mint_client(PRF_CN);
 
+    // CN off every list, plus a DNS SAN that collides with the PRF identity.
+    let (san_smuggle_cert_pem, san_smuggle_key_pem) = {
+        let key = KeyPair::generate().unwrap();
+        let mut cp = CertificateParams::new(vec![PRF_CN.to_string()]).unwrap();
+        cp.distinguished_name.push(DnType::CommonName, "sneaky-rp");
+        cp.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        let cert = cp.signed_by(&key, &ca_cert, &ca_key).unwrap();
+        (cert.pem(), key.serialize_pem())
+    };
+
     Pki {
         ca_pem: ca_cert.pem(),
         server_cert_pem: server_cert.pem(),
@@ -105,6 +121,8 @@ pub fn make_pki() -> Pki {
         other_key_pem,
         prf_cert_pem,
         prf_key_pem,
+        san_smuggle_cert_pem,
+        san_smuggle_key_pem,
     }
 }
 
@@ -333,6 +351,12 @@ pub fn other_client(pki: &Pki) -> reqwest::Client {
 /// A reqwest client presenting the PRF client certificate (CN minister).
 pub fn prf_client(pki: &Pki) -> reqwest::Client {
     client_with_identity(pki, &pki.prf_cert_pem, &pki.prf_key_pem)
+}
+
+/// A reqwest client presenting the SAN-smuggling certificate (CN "sneaky-rp",
+/// DNS SAN "minister").
+pub fn san_smuggle_client(pki: &Pki) -> reqwest::Client {
+    client_with_identity(pki, &pki.san_smuggle_cert_pem, &pki.san_smuggle_key_pem)
 }
 
 /// A reqwest client with NO client certificate (should be rejected by mTLS).

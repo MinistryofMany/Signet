@@ -440,11 +440,18 @@ const MAX_REASSIGN_REFS: usize = 256;
 
 /// Per-route, fail-closed PRF authorization + the PRF rate-limit bucket.
 ///
-/// Mirrors the `is_admin()` gate on /key/rotate: the check runs INSIDE every
-/// /prf/* and /dedup/* handler against the DEDICATED allow-list flag —
-/// connection-level classification (including the open back-compat client
-/// list) never grants PRF access. Authorization is checked before the rate
-/// limit so an unauthorized caller always sees 403 and cannot consume budget.
+/// Mirrors the `is_admin()` gate on /key/rotate, in TWO layers that must
+/// agree: (1) the `prf_allowed` flag, pinned per connection by `classify()`
+/// against the dedicated `SIGNET_PRF_CLIENT_IDS` set — connection-level
+/// client classification (including the open back-compat client list) never
+/// grants it; and (2) an in-handler membership re-check of the PINNED
+/// identity name against the same set held on [`PrfState`] (immutable after
+/// boot), so a future `classify()` refactor bug cannot silently widen the
+/// PRF surface. Deliberate side effect of layer 2: an identity whose pinned
+/// name came from another list (e.g. an allow-listed CN carrying a stray
+/// PRF-colliding SAN) is refused — the audited name must ITSELF be the
+/// PRF-authorized name. Authorization is checked before the rate limit so an
+/// unauthorized caller always sees 403 and cannot consume budget.
 fn require_prf<'a>(state: &'a AppState, identity: &ClientIdentity) -> AppResult<&'a PrfState> {
     let prf = state.prf.as_ref().ok_or_else(|| {
         // The PRF routes are only mounted when the state exists; reaching this
@@ -456,6 +463,16 @@ fn require_prf<'a>(state: &'a AppState, identity: &ClientIdentity) -> AppResult<
         tracing::warn!(
             identity = %identity.name,
             "rejected PRF request: identity not on SIGNET_PRF_CLIENT_IDS"
+        );
+        return Err(AppError::Forbidden(
+            "client identity is not authorized for the PRF surface",
+        ));
+    }
+    if !prf.allowed_client_ids.contains(&identity.name) {
+        tracing::warn!(
+            identity = %identity.name,
+            "rejected PRF request: pinned identity name is not on SIGNET_PRF_CLIENT_IDS \
+             (second-layer allow-list check)"
         );
         return Err(AppError::Forbidden(
             "client identity is not authorized for the PRF surface",

@@ -14,8 +14,12 @@ use std::sync::Arc;
 /// even mounted.
 pub struct PrfState {
     pub keys: PrfKeys,
-    /// The `SIGNET_PRF_CLIENT_IDS` allow-list, checked INSIDE each PRF/dedup
-    /// handler (per-route, fail-closed — mirroring the `is_admin()` gate).
+    /// The `SIGNET_PRF_CLIENT_IDS` allow-list, immutable after boot. Second
+    /// layer of the two-layer PRF gate: `classify()` pins the `prf_allowed`
+    /// flag per connection from this same set (the authoritative grant), and
+    /// `require_prf` re-checks the pinned identity NAME against this copy
+    /// inside every PRF/dedup handler (defense in depth — a classification
+    /// bug cannot silently widen the PRF surface past this membership check).
     pub allowed_client_ids: BTreeSet<String>,
     /// The PRF surface's own rate-limit bucket (separate from /sign + /key*).
     pub rate_limiter: KeyRateLimiter,
