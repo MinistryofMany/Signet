@@ -654,7 +654,7 @@ pub async fn prf_disclose(
         .dedup_entry_by_ref(&entry_ref)
         .map_err(AppError::Internal)?
         .ok_or(AppError::NotFound("no such dedup entry"))?;
-    if entry.owner_tag != req.owner_handle {
+    if !db::owner_eq(&entry.owner_tag, &req.owner_handle) {
         tracing::warn!(
             identity = %identity.name,
             endpoint = "prf/disclose",

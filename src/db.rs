@@ -88,6 +88,18 @@ pub enum DedupReassign {
     OwnerMismatch,
 }
 
+/// Constant-time owner-handle equality for the dedup ledger's authorization
+/// compares (register/release/reassign classification and the disclose owner
+/// check). Handles are 128-bit random values minted by Minister and only
+/// PRF-allow-listed callers reach these paths, so a remote timing oracle is
+/// already impractical — but this is a crypto-core authorization compare, so
+/// it does not short-circuit on content. The length check inside `ct_eq` is
+/// the only data-dependent branch (handle length is not secret).
+pub(crate) fn owner_eq(a: &str, b: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    a.as_bytes().ct_eq(b.as_bytes()).into()
+}
+
 /// Current unix time in seconds.
 ///
 /// `SystemTime::now()` can only be before the unix epoch if the host clock is
@@ -417,7 +429,7 @@ impl Db {
                     .optional()
                     .map_err(|e| e.to_string())?;
                 match existing {
-                    Some((existing_ref, existing_owner)) if existing_owner == owner_tag => {
+                    Some((existing_ref, existing_owner)) if owner_eq(&existing_owner, owner_tag) => {
                         Ok(DedupRegister::AlreadyYours {
                             entry_ref: existing_ref,
                         })
@@ -468,7 +480,7 @@ impl Db {
             .map_err(|e| e.to_string())?;
         match existing {
             None => Ok(DedupRelease::NotFound),
-            Some(owner) if owner != owner_tag => Ok(DedupRelease::OwnerMismatch),
+            Some(owner) if !owner_eq(&owner, owner_tag) => Ok(DedupRelease::OwnerMismatch),
             Some(_) => {
                 conn.execute(
                     "DELETE FROM dedup_entries WHERE entry_ref = ?1",
@@ -504,7 +516,7 @@ impl Db {
                 .map_err(|e| e.to_string())?;
             match owner {
                 None => return Ok(DedupReassign::NotFound), // tx drops -> rollback
-                Some(owner) if owner == from => {
+                Some(owner) if owner_eq(&owner, from) => {
                     tx.execute(
                         "UPDATE dedup_entries SET owner_tag = ?1 WHERE entry_ref = ?2",
                         params![to, entry_ref],
@@ -512,7 +524,7 @@ impl Db {
                     .map_err(|e| e.to_string())?;
                     moved += 1;
                 }
-                Some(owner) if owner == to => {} // already moved (retry) — no-op
+                Some(owner) if owner_eq(&owner, to) => {} // already moved (retry) — no-op
                 Some(_) => return Ok(DedupReassign::OwnerMismatch), // rollback
             }
         }

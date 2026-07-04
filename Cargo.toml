@@ -35,6 +35,9 @@ sha2 = "=0.10.9"
 # 0.6 RNG traits, which the crate's own `rand` 0.9 (rand_core 0.9) does not
 # implement.
 rand_core = { version = "=0.6.4", features = ["getrandom"] }
+# Constant-time owner-handle comparison on the dedup ledger (already in-tree
+# via curve25519-dalek; same version, pinned exact).
+subtle = "=2.6.1"
 
 # HTTP + TLS
 axum = { version = "0.8", default-features = false, features = ["json", "tokio", "http1", "query"] }
