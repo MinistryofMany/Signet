@@ -1,0 +1,455 @@
+//! Service-key lifecycle and the fail-closed PRF boot policy.
+//!
+//! The nullifier keys are NEVER-ROTATE: anchors are discarded after
+//! nullification, so there is no re-derivation path and a silent key fork
+//! (e.g. generate-if-absent racing a replica restore) would be an
+//! unrecoverable split of the dedup namespace. Every rule here exists to make
+//! that structurally impossible:
+//!
+//! - **Explicit one-shot init.** The master seed is minted ONLY by
+//!   `signet init-service-keys` (or `SIGNET_INIT_SERVICE_KEYS=1`), which
+//!   seals it into `service_keys`, prints the derived public key `pkS` (and
+//!   ONLY `pkS` — never seed bytes) for pinning, and exits.
+//! - **Ordinary boot never generates.** PRF surface configured + seed absent
+//!   → refuse to start, on every node (a replica that boots before its
+//!   keystore restore completes must hard-fail, never mint a fresh seed).
+//! - **Public-key pin.** Seed present → the derived `pkS` MUST equal
+//!   `SIGNET_DEDUP_PUBKEY_PIN`, else refuse to start. Minister pins the same
+//!   value, so a forked key can never serve `/prf/evaluate` from either side.
+//! - **Fail-closed allow-list.** Keys initialized + empty
+//!   `SIGNET_PRF_CLIENT_IDS` → refuse startup (the admin-list posture, not
+//!   the open-client-list one). Keys absent + no PRF config → the PRF routes
+//!   are simply not mounted and the existing /sign deployment is unchanged.
+//! - **One-shot pairwise import.** `SIGNET_IMPORT_PAIRWISE_HMAC` is consumed
+//!   at config load (zeroize + remove_var, the SIGNET_KEK pattern) and sealed
+//!   here on first boot; a second import while a sealed copy exists refuses
+//!   startup rather than silently overwriting. The seal runs only AFTER every
+//!   other boot validation (pin check included) passes: a refusing boot never
+//!   persists the imported secret as a side effect.
+
+use crate::db::Db;
+use crate::keystore::Kek;
+use crate::prf::{PrfKeys, MASTER_SEED_LEN, MASTER_SEED_PURPOSE, PAIRWISE_HMAC_PURPOSE};
+use rand::TryRngCore;
+use zeroize::Zeroizing;
+
+/// AAD key-id used when sealing service keys. There is exactly one row per
+/// purpose; the purpose string is the AAD group identity, so a sealed blob
+/// cannot be replayed under a different purpose.
+///
+/// DOMAIN-SEPARATION INVARIANT (load-bearing): service keys always seal with
+/// key-id 0, while group keys seal under their `group_keys.key_id` rowid,
+/// which SQLite assigns starting at 1 (checked in
+/// `db::insert_active_key_resealed`). `group_id` is client-chosen free text
+/// (a group literally named "master-seed-v1" is legal), so the 0-vs-≥1
+/// key-id split — not the purpose string — is what makes a cross-table blob
+/// swap fail AES-GCM authentication.
+const SERVICE_KEY_ID: i64 = 0;
+
+/// Guard for the one-shot init mode, run BEFORE anything is minted. Minting
+/// must be structurally impossible on a node that is configured to belong to
+/// an existing keyspace:
+///
+/// - `SIGNET_DEDUP_PUBKEY_PIN` set → the pinned seed already exists somewhere
+///   by definition, so this node must restore its keystore, never initialize.
+///   This closes the operator-error fork: a stray `SIGNET_INIT_SERVICE_KEYS=1`
+///   left in a persistent unit env can no longer mint a fresh seed on a
+///   replica that boots before its keystore restore completes.
+/// - `SIGNET_IMPORT_PAIRWISE_HMAC` set → the import is consumed at ordinary
+///   boot after all boot validations pass; on an init invocation it would be
+///   silently ignored, so refuse loudly instead (the caller must still
+///   consume/zeroize the variable before calling this).
+pub fn check_init_preconditions(
+    pin_configured: bool,
+    import_configured: bool,
+) -> Result<(), String> {
+    if pin_configured {
+        return Err(
+            "SIGNET_DEDUP_PUBKEY_PIN is set; refusing to initialize service keys. A pinned \
+             node's master seed already exists elsewhere by definition (key-fork guard): \
+             restore the keystore instead. Run the one deliberate first-time init without \
+             the pin, then pin the printed public key"
+                .to_string(),
+        );
+    }
+    if import_configured {
+        return Err(
+            "SIGNET_IMPORT_PAIRWISE_HMAC is set on an init invocation; refusing (the \
+             variable has been consumed and removed from the environment). The pairwise \
+             import is sealed on the first ORDINARY boot after validations pass — run \
+             init without it, then boot once with the import variable set"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// One-shot service-key initialization. Mints a fresh 32-byte master seed
+/// from OS randomness, seals it into `service_keys`, and returns the derived
+/// public key `pkS` in the pin encoding (base64url, no padding). Refuses if
+/// service keys are already initialized. NEVER returns or logs seed bytes.
+pub fn init_service_keys(db: &Db, kek: &Kek) -> Result<String, String> {
+    if db.get_service_key(MASTER_SEED_PURPOSE)?.is_some() {
+        return Err(
+            "service keys are already initialized; refusing to overwrite (the nullifier \
+             master seed is never-rotate)"
+                .to_string(),
+        );
+    }
+    let mut seed = Zeroizing::new([0u8; MASTER_SEED_LEN]);
+    rand::rngs::OsRng
+        .try_fill_bytes(seed.as_mut())
+        .map_err(|e| format!("OS RNG failure: {e}"))?;
+    seal_master_seed(db, kek, &seed)
+}
+
+/// Seal a PROVIDED master seed into `service_keys`, returning the derived
+/// `pkS` in the pin encoding. Refuses if service keys already exist.
+///
+/// This is the deliberate-injection path for the integration test harness
+/// (which needs a FIXED seed to assert frozen vectors over the real HTTP
+/// surface). Production initialization always mints fresh OS randomness via
+/// [`init_service_keys`]; nothing routes user input here.
+pub fn seal_master_seed(
+    db: &Db,
+    kek: &Kek,
+    seed: &[u8; MASTER_SEED_LEN],
+) -> Result<String, String> {
+    if db.get_service_key(MASTER_SEED_PURPOSE)?.is_some() {
+        return Err("service keys are already initialized; refusing to overwrite".to_string());
+    }
+    let keys = PrfKeys::from_seed(*seed, None)?;
+    let pk = keys.public_key_b64();
+    let sealed = kek.seal(MASTER_SEED_PURPOSE, SERVICE_KEY_ID, seed)?;
+    if !db.insert_service_key(MASTER_SEED_PURPOSE, &sealed)? {
+        return Err("service keys were initialized concurrently; refusing".to_string());
+    }
+    Ok(pk)
+}
+
+/// Inputs to the boot policy, extracted from [`crate::config::Config`].
+pub struct PrfBootArgs<'a> {
+    /// Whether `SIGNET_PRF_CLIENT_IDS` is non-empty (the PRF surface is
+    /// configured to be enabled).
+    pub prf_clients_configured: bool,
+    /// The pinned `pkS` (`SIGNET_DEDUP_PUBKEY_PIN`), required when enabled.
+    pub dedup_pubkey_pin: Option<&'a str>,
+    /// The consumed `SIGNET_IMPORT_PAIRWISE_HMAC` bytes, if set on this boot.
+    pub import_pairwise: Option<Zeroizing<Vec<u8>>>,
+}
+
+/// Outcome of the boot policy.
+pub enum PrfBoot {
+    /// PRF surface not configured and no keys present: routes are not
+    /// mounted; the existing /sign deployment behavior is unchanged.
+    Disabled,
+    /// PRF surface enabled: keys loaded, pin verified.
+    Enabled(Box<PrfKeys>),
+}
+
+/// Evaluate the fail-closed boot matrix and load/import the service keys.
+/// Any `Err` from this function must abort startup.
+pub fn prepare_prf_boot(db: &Db, kek: &Kek, args: PrfBootArgs<'_>) -> Result<PrfBoot, String> {
+    let sealed_seed = db.get_service_key(MASTER_SEED_PURPOSE)?;
+
+    match (sealed_seed, args.prf_clients_configured) {
+        (None, false) => {
+            if args.import_pairwise.is_some() {
+                return Err(
+                    "SIGNET_IMPORT_PAIRWISE_HMAC is set but the PRF surface is not enabled \
+                     (no service keys, no SIGNET_PRF_CLIENT_IDS); refusing to start rather \
+                     than sealing a secret into a surface that is not configured"
+                        .to_string(),
+                );
+            }
+            if args.dedup_pubkey_pin.is_some() {
+                return Err(
+                    "SIGNET_DEDUP_PUBKEY_PIN is set but the PRF surface is not configured \
+                     (no service keys, no SIGNET_PRF_CLIENT_IDS); refusing to start rather \
+                     than silently ignoring a pinned key (config slip: set \
+                     SIGNET_PRF_CLIENT_IDS and restore the keystore, or unset the pin)"
+                        .to_string(),
+                );
+            }
+            Ok(PrfBoot::Disabled)
+        }
+        (Some(_), false) => Err(
+            "service keys are initialized but SIGNET_PRF_CLIENT_IDS is empty; refusing to \
+             start (fail-closed: an initialized PRF keystore with no allow-list would \
+             otherwise be one config slip away from an open HMAC oracle)"
+                .to_string(),
+        ),
+        (None, true) => Err(
+            "SIGNET_PRF_CLIENT_IDS is configured but the service keys are not initialized; \
+             refusing to start. Run `signet init-service-keys` exactly once on the primary. \
+             A replica must wait for its keystore restore to complete — NEVER initialize a \
+             fresh seed on a node that should be serving an existing one (key-fork guard)"
+                .to_string(),
+        ),
+        (Some(sealed), true) => {
+            let pin = args.dedup_pubkey_pin.map(str::trim).ok_or(
+                "SIGNET_DEDUP_PUBKEY_PIN is required when the PRF surface is enabled; pin \
+                 the public key printed by `signet init-service-keys`",
+            )?;
+            let seed_bytes =
+                Zeroizing::new(kek.open(MASTER_SEED_PURPOSE, SERVICE_KEY_ID, &sealed)?);
+            if seed_bytes.len() != MASTER_SEED_LEN {
+                return Err(format!(
+                    "sealed master seed has unexpected length {} (expected {MASTER_SEED_LEN})",
+                    seed_bytes.len()
+                ));
+            }
+            let mut seed = Zeroizing::new([0u8; MASTER_SEED_LEN]);
+            seed.copy_from_slice(&seed_bytes);
+
+            // Pairwise secret: resolve the bytes WITHOUT persisting anything.
+            // A boot that ultimately refuses (e.g. a pin mismatch on a forked
+            // or wrong node) must not leave a sealed copy of the imported
+            // secret on that node's disk as a side effect, so the one-shot
+            // import is sealed only AFTER every boot validation passes.
+            let (pairwise, importing) = match args.import_pairwise {
+                Some(secret) => {
+                    if db.get_service_key(PAIRWISE_HMAC_PURPOSE)?.is_some() {
+                        return Err(
+                            "SIGNET_IMPORT_PAIRWISE_HMAC is set but a sealed pairwise secret \
+                             already exists; refusing to start (unset the env var — the \
+                             sealed copy is authoritative and is never silently overwritten)"
+                                .to_string(),
+                        );
+                    }
+                    (Some(secret), true)
+                }
+                None => match db.get_service_key(PAIRWISE_HMAC_PURPOSE)? {
+                    Some(sealed_pw) => (
+                        Some(Zeroizing::new(kek.open(
+                            PAIRWISE_HMAC_PURPOSE,
+                            SERVICE_KEY_ID,
+                            &sealed_pw,
+                        )?)),
+                        false,
+                    ),
+                    None => (None, false),
+                },
+            };
+
+            let keys =
+                PrfKeys::from_seed(*seed, pairwise.as_ref().map(|s| Zeroizing::new(s.to_vec())))?;
+            let derived = keys.public_key_b64();
+            if derived != pin {
+                // Both values are public keys — safe to surface for ops.
+                return Err(format!(
+                    "derived VOPRF public key {derived} does not match SIGNET_DEDUP_PUBKEY_PIN \
+                     {pin}; refusing to start (key-fork guard: this node's sealed seed is not \
+                     the pinned one)"
+                ));
+            }
+
+            // All boot validations passed — only now persist a first-boot import.
+            if importing {
+                let secret = pairwise.expect("importing implies the secret bytes are present");
+                let sealed_pw = kek.seal(PAIRWISE_HMAC_PURPOSE, SERVICE_KEY_ID, &secret)?;
+                if !db.insert_service_key(PAIRWISE_HMAC_PURPOSE, &sealed_pw)? {
+                    return Err(
+                        "pairwise secret import raced a concurrent insert; refusing".to_string()
+                    );
+                }
+                tracing::info!(
+                    "imported the pairwise HMAC secret into service_keys (env consumed)"
+                );
+            }
+            Ok(PrfBoot::Enabled(Box::new(keys)))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_kek() -> Kek {
+        Kek::from_encoded(&hex::encode([0x77u8; 32])).unwrap()
+    }
+
+    /// Extract the error from a boot attempt without requiring Debug on
+    /// PrfBoot (which holds key material and deliberately has no Debug impl).
+    fn boot_err(db: &Db, kek: &Kek, a: PrfBootArgs<'_>) -> String {
+        match prepare_prf_boot(db, kek, a) {
+            Err(e) => e,
+            Ok(_) => panic!("expected the boot policy to refuse"),
+        }
+    }
+
+    fn args<'a>(configured: bool, pin: Option<&'a str>, import: Option<&[u8]>) -> PrfBootArgs<'a> {
+        PrfBootArgs {
+            prf_clients_configured: configured,
+            dedup_pubkey_pin: pin,
+            import_pairwise: import.map(|b| Zeroizing::new(b.to_vec())),
+        }
+    }
+
+    #[test]
+    fn init_is_one_shot_and_prints_only_pk() {
+        let db = Db::open_in_memory().unwrap();
+        let kek = test_kek();
+        let pk = init_service_keys(&db, &kek).unwrap();
+        // The pin encoding: base64url no padding, 32-byte element -> 43 chars.
+        assert_eq!(pk.len(), 43);
+        assert!(pk
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
+        // A second init must refuse (never-rotate, never overwrite).
+        assert!(init_service_keys(&db, &kek).is_err());
+        // The sealed row exists and opens back to a 32-byte seed under the KEK.
+        let sealed = db.get_service_key(MASTER_SEED_PURPOSE).unwrap().unwrap();
+        let seed = kek.open(MASTER_SEED_PURPOSE, 0, &sealed).unwrap();
+        assert_eq!(seed.len(), MASTER_SEED_LEN);
+        // And the returned pk is exactly the one derived from that seed.
+        let mut arr = [0u8; MASTER_SEED_LEN];
+        arr.copy_from_slice(&seed);
+        assert_eq!(PrfKeys::from_seed(arr, None).unwrap().public_key_b64(), pk);
+    }
+
+    #[test]
+    fn boot_disabled_when_nothing_configured() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(matches!(
+            prepare_prf_boot(&db, &test_kek(), args(false, None, None)).unwrap(),
+            PrfBoot::Disabled
+        ));
+    }
+
+    #[test]
+    fn boot_refuses_seed_absent_with_prf_clients_configured() {
+        let db = Db::open_in_memory().unwrap();
+        let err = boot_err(&db, &test_kek(), args(true, Some("pin"), None));
+        assert!(err.contains("not initialized"), "{err}");
+    }
+
+    #[test]
+    fn boot_refuses_initialized_keys_with_empty_prf_list() {
+        let db = Db::open_in_memory().unwrap();
+        let kek = test_kek();
+        init_service_keys(&db, &kek).unwrap();
+        let err = boot_err(&db, &kek, args(false, None, None));
+        assert!(err.contains("SIGNET_PRF_CLIENT_IDS is empty"), "{err}");
+    }
+
+    #[test]
+    fn boot_refuses_missing_or_mismatched_pin() {
+        let db = Db::open_in_memory().unwrap();
+        let kek = test_kek();
+        let pk = init_service_keys(&db, &kek).unwrap();
+        // Missing pin.
+        let err = boot_err(&db, &kek, args(true, None, None));
+        assert!(err.contains("SIGNET_DEDUP_PUBKEY_PIN is required"), "{err}");
+        // Mismatched pin (a forked/wrong seed scenario).
+        let err = boot_err(
+            &db,
+            &kek,
+            args(
+                true,
+                Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+                None,
+            ),
+        );
+        assert!(err.contains("does not match"), "{err}");
+        // Correct pin boots (whitespace around the pin is tolerated).
+        let padded = format!(" {pk}\n");
+        assert!(matches!(
+            prepare_prf_boot(&db, &kek, args(true, Some(&padded), None)).unwrap(),
+            PrfBoot::Enabled(_)
+        ));
+    }
+
+    #[test]
+    fn pairwise_import_is_one_shot_and_persists() {
+        let db = Db::open_in_memory().unwrap();
+        let kek = test_kek();
+        let pk = init_service_keys(&db, &kek).unwrap();
+        let secret = b"live-pairwise-secret-bytes";
+
+        // First boot with the import env: sealed + usable.
+        let keys = match prepare_prf_boot(&db, &kek, args(true, Some(&pk), Some(secret))).unwrap() {
+            PrfBoot::Enabled(keys) => keys,
+            PrfBoot::Disabled => panic!("must be enabled"),
+        };
+        assert!(keys.has_pairwise());
+        let out_first = keys.pairwise(b"probe").unwrap();
+
+        // Second boot with the import STILL set: refuse (no silent overwrite).
+        let err = boot_err(&db, &kek, args(true, Some(&pk), Some(secret)));
+        assert!(err.contains("already exists"), "{err}");
+
+        // Ordinary boot without the env: loads the sealed copy, byte-identical.
+        let keys = match prepare_prf_boot(&db, &kek, args(true, Some(&pk), None)).unwrap() {
+            PrfBoot::Enabled(keys) => keys,
+            PrfBoot::Disabled => panic!("must be enabled"),
+        };
+        assert!(keys.has_pairwise());
+        assert_eq!(keys.pairwise(b"probe").unwrap(), out_first);
+    }
+
+    #[test]
+    fn pin_mismatch_boot_does_not_seal_the_pairwise_import() {
+        let db = Db::open_in_memory().unwrap();
+        let kek = test_kek();
+        let pk = init_service_keys(&db, &kek).unwrap();
+        let secret = b"live-pairwise-secret-bytes";
+
+        // Boot with the import env set but a MISMATCHED pin (wrong/forked
+        // node): must refuse AND must not have persisted the secret.
+        let err = boot_err(
+            &db,
+            &kek,
+            args(
+                true,
+                Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+                Some(secret),
+            ),
+        );
+        assert!(err.contains("does not match"), "{err}");
+        assert!(
+            db.get_service_key(PAIRWISE_HMAC_PURPOSE).unwrap().is_none(),
+            "a refusing boot must not leave a sealed pairwise secret behind"
+        );
+
+        // A corrected boot with the import STILL set now succeeds (the fix
+        // means the failed attempt did not consume the one-shot import).
+        let keys = match prepare_prf_boot(&db, &kek, args(true, Some(&pk), Some(secret))).unwrap() {
+            PrfBoot::Enabled(keys) => keys,
+            PrfBoot::Disabled => panic!("must be enabled"),
+        };
+        assert!(keys.has_pairwise());
+    }
+
+    #[test]
+    fn boot_refuses_import_when_surface_disabled() {
+        let db = Db::open_in_memory().unwrap();
+        let err = boot_err(&db, &test_kek(), args(false, None, Some(b"secret")));
+        assert!(err.contains("not enabled"), "{err}");
+    }
+
+    #[test]
+    fn boot_refuses_orphaned_pubkey_pin() {
+        // A pin with no keys and no PRF allow-list is a config slip (e.g. the
+        // allow-list was forgotten); refuse rather than silently mounting
+        // nothing while the operator believes the surface is pinned.
+        let db = Db::open_in_memory().unwrap();
+        let err = boot_err(&db, &test_kek(), args(false, Some("some-pin"), None));
+        assert!(err.contains("SIGNET_DEDUP_PUBKEY_PIN is set"), "{err}");
+    }
+
+    #[test]
+    fn init_refuses_on_a_pinned_or_importing_node() {
+        // A pinned node must NEVER mint: its seed exists elsewhere by
+        // definition.
+        let err = check_init_preconditions(true, false).unwrap_err();
+        assert!(err.contains("refusing to initialize"), "{err}");
+        // An init invocation carrying the pairwise import refuses loudly
+        // instead of silently ignoring the secret.
+        let err = check_init_preconditions(false, true).unwrap_err();
+        assert!(err.contains("init invocation"), "{err}");
+        // The deliberate first-time init (no pin, no import) proceeds.
+        assert!(check_init_preconditions(false, false).is_ok());
+    }
+}

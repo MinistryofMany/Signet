@@ -24,8 +24,16 @@ pub enum AppError {
     /// Maps to HTTP 202 Accepted with `{ "status": "pending" }`.
     KeyPending,
     /// The caller's pinned client identity is not authorized for this endpoint
-    /// (e.g. a non-admin calling `/key/rotate`). Maps to HTTP 403.
+    /// (e.g. a non-admin calling `/key/rotate`, a non-PRF identity calling
+    /// `/prf/*`, or an owner-handle mismatch on the dedup ledger). Maps to
+    /// HTTP 403.
     Forbidden(&'static str),
+    /// A referenced resource (e.g. a dedup entry ref) does not exist. Maps to
+    /// HTTP 404 with the `not_found` code.
+    NotFound(&'static str),
+    /// The dedup value is already registered to a DIFFERENT owner. Maps to
+    /// HTTP 409 with the `taken` code (one-credential-one-account).
+    DedupTaken,
     /// Internal failure (DB, crypto, encoding). Never includes detail in body.
     Internal(String),
 }
@@ -39,6 +47,8 @@ impl std::fmt::Display for AppError {
             AppError::NoSuchKey => write!(f, "no such key"),
             AppError::KeyPending => write!(f, "key pending"),
             AppError::Forbidden(m) => write!(f, "forbidden: {m}"),
+            AppError::NotFound(m) => write!(f, "not found: {m}"),
+            AppError::DedupTaken => write!(f, "taken"),
             AppError::Internal(m) => write!(f, "internal error: {m}"),
         }
     }
@@ -55,6 +65,8 @@ impl IntoResponse for AppError {
             AppError::NoSuchKey => (StatusCode::NOT_FOUND, "no_such_key"),
             AppError::KeyPending => (StatusCode::ACCEPTED, "pending"),
             AppError::Forbidden(_) => (StatusCode::FORBIDDEN, "forbidden"),
+            AppError::NotFound(_) => (StatusCode::NOT_FOUND, "not_found"),
+            AppError::DedupTaken => (StatusCode::CONFLICT, "taken"),
             AppError::Internal(detail) => {
                 // Log detail; never return it to the caller.
                 tracing::error!(error = %detail, "internal error");
@@ -70,6 +82,8 @@ impl IntoResponse for AppError {
             AppError::NoSuchKey => "no key for this group",
             AppError::KeyPending => "key is being generated; retry shortly",
             AppError::Forbidden(m) => *m,
+            AppError::NotFound(m) => *m,
+            AppError::DedupTaken => "this credential is already registered to another owner",
             AppError::Internal(_) => "internal error",
         };
         // The pending status uses `status` rather than `error` so clients can

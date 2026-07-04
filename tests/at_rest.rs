@@ -103,3 +103,91 @@ async fn private_key_is_ciphertext_at_rest() {
         "control: plaintext PKCS#8 should contain the rsaEncryption OID"
     );
 }
+
+#[tokio::test]
+async fn service_keys_are_ciphertext_at_rest() {
+    // The PRF service keys (master seed + imported pairwise secret) must be
+    // stored ONLY as KEK-sealed AES-GCM envelopes: neither the fixed test
+    // seed bytes nor the pairwise secret bytes may appear anywhere in the
+    // database file's service_keys rows.
+    let pki = make_pki();
+    let seed = *b"MINISTER-TEST-VECTOR-SEED-0001!!";
+    let pairwise = b"minister-golden-vector-secret-v1-do-not-change!!".to_vec();
+    let server = start_server(
+        &pki,
+        ServerOpts {
+            prf: Some(PrfOpts {
+                master_seed: seed,
+                pairwise_secret: Some(pairwise.clone()),
+                ..PrfOpts::default()
+            }),
+            ..ServerOpts::default()
+        },
+    )
+    .await;
+
+    let conn = Connection::open(&server.db_path).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT purpose, sealed FROM service_keys")
+        .unwrap();
+    let rows: Vec<(String, Vec<u8>)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    let purposes: Vec<&str> = rows.iter().map(|(p, _)| p.as_str()).collect();
+    assert!(purposes.contains(&"master-seed-v1"), "seed row present");
+    assert!(
+        purposes.contains(&"pairwise-hmac-v1"),
+        "pairwise row present"
+    );
+
+    for (purpose, blob) in &rows {
+        assert_eq!(
+            blob[0], 0x01,
+            "service key {purpose} must be our sealed envelope (v1)"
+        );
+        assert!(
+            !contains(blob, &seed),
+            "service key {purpose} contains the plaintext master seed"
+        );
+        assert!(
+            !contains(blob, &pairwise),
+            "service key {purpose} contains the plaintext pairwise secret"
+        );
+        // No long plaintext substring either (a partial leak is still a leak).
+        assert!(
+            !contains(blob, &seed[..16]),
+            "service key {purpose} contains a seed prefix"
+        );
+        assert!(
+            !contains(blob, &pairwise[..16]),
+            "service key {purpose} contains a pairwise-secret prefix"
+        );
+    }
+
+    // Raw-file scan: the secret bytes must appear nowhere in the database
+    // file OR its WAL (not just in the service_keys rows the query above
+    // selected) — a partial page copy or another table leaking the material
+    // would be caught here.
+    let mut file_bytes = std::fs::read(&server.db_path).unwrap();
+    let wal_path = server.db_path.with_extension("db-wal");
+    if let Ok(mut wal_bytes) = std::fs::read(&wal_path) {
+        file_bytes.append(&mut wal_bytes);
+    }
+    assert!(!file_bytes.is_empty(), "expected raw DB bytes to scan");
+    for (what, needle) in [
+        ("master seed", &seed[..]),
+        ("master seed prefix", &seed[..16]),
+        ("pairwise secret", &pairwise[..]),
+        ("pairwise secret prefix", &pairwise[..16]),
+    ] {
+        assert!(
+            !contains(&file_bytes, needle),
+            "raw DB file (incl. WAL) contains the plaintext {what}"
+        );
+    }
+
+    // Control: the check is meaningful — the seed does contain its own prefix.
+    assert!(contains(&seed, &seed[..16]));
+}

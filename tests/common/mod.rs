@@ -12,15 +12,17 @@ use rcgen::{
     KeyUsagePurpose, SanType,
 };
 use signet::db::Db;
+use signet::dedup::{prepare_prf_boot, PrfBoot, PrfBootArgs};
 use signet::identity::IdentityPolicy;
 use signet::keygen::KeygenService;
 use signet::keystore::Kek;
 use signet::ratelimit::{KeyRateLimiter, RateLimiter};
-use signet::state::AppState;
+use signet::state::{AppState, PrfState};
 use std::collections::BTreeSet;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::Once;
+use zeroize::Zeroizing;
 
 static INIT: Once = Once::new();
 
@@ -44,6 +46,15 @@ pub struct Pki {
     /// that chains to the CA but is off the allow-list is rejected).
     pub other_cert_pem: String,
     pub other_key_pem: String,
+    /// PRF client identity: CN "minister".
+    pub prf_cert_pem: String,
+    pub prf_key_pem: String,
+    /// A cert with an off-list CN but a DNS SAN colliding with the PRF
+    /// identity (CN "sneaky-rp", SAN "minister"): proves the second-layer
+    /// name check refuses a SAN-smuggled PRF grant when the pinned identity
+    /// name came from another list.
+    pub san_smuggle_cert_pem: String,
+    pub san_smuggle_key_pem: String,
 }
 
 /// CN of the default client cert.
@@ -52,6 +63,8 @@ pub const CLIENT_CN: &str = "freedink";
 pub const ADMIN_CN: &str = "signet-admin";
 /// CN of the second, non-allow-listed client cert.
 pub const OTHER_CN: &str = "intruder";
+/// CN of the PRF client cert.
+pub const PRF_CN: &str = "minister";
 
 pub fn make_pki() -> Pki {
     let ca_key = KeyPair::generate().unwrap();
@@ -84,6 +97,17 @@ pub fn make_pki() -> Pki {
     let (client_cert_pem, client_key_pem) = mint_client(CLIENT_CN);
     let (admin_cert_pem, admin_key_pem) = mint_client(ADMIN_CN);
     let (other_cert_pem, other_key_pem) = mint_client(OTHER_CN);
+    let (prf_cert_pem, prf_key_pem) = mint_client(PRF_CN);
+
+    // CN off every list, plus a DNS SAN that collides with the PRF identity.
+    let (san_smuggle_cert_pem, san_smuggle_key_pem) = {
+        let key = KeyPair::generate().unwrap();
+        let mut cp = CertificateParams::new(vec![PRF_CN.to_string()]).unwrap();
+        cp.distinguished_name.push(DnType::CommonName, "sneaky-rp");
+        cp.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        let cert = cp.signed_by(&key, &ca_cert, &ca_key).unwrap();
+        (cert.pem(), key.serialize_pem())
+    };
 
     Pki {
         ca_pem: ca_cert.pem(),
@@ -95,6 +119,10 @@ pub fn make_pki() -> Pki {
         admin_key_pem,
         other_cert_pem,
         other_key_pem,
+        prf_cert_pem,
+        prf_key_pem,
+        san_smuggle_cert_pem,
+        san_smuggle_key_pem,
     }
 }
 
@@ -108,6 +136,33 @@ pub struct Server {
 impl Drop for Server {
     fn drop(&mut self) {
         self.handle.abort();
+    }
+}
+
+/// PRF-surface knobs for the test server. Present = the surface is enabled
+/// through the REAL boot path (seed sealed into service_keys, pairwise
+/// imported via the one-shot import path, pin computed and verified).
+pub struct PrfOpts {
+    /// Identities allowed on the PRF surface (SIGNET_PRF_CLIENT_IDS analogue).
+    pub client_ids: BTreeSet<String>,
+    /// The FIXED master seed (fixed so frozen vectors are assertable).
+    pub master_seed: [u8; 32],
+    /// Pairwise secret to import (None = /prf/pairwise not initialized).
+    pub pairwise_secret: Option<Vec<u8>>,
+    /// Per-identity + global PRF rate-limit ceilings.
+    pub rl_identity_max: u32,
+    pub rl_global_max: u32,
+}
+
+impl Default for PrfOpts {
+    fn default() -> Self {
+        Self {
+            client_ids: id_set(&[PRF_CN]),
+            master_seed: *b"MINISTER-TEST-VECTOR-SEED-0001!!",
+            pairwise_secret: Some(b"minister-golden-vector-secret-v1-do-not-change!!".to_vec()),
+            rl_identity_max: 1_000_000,
+            rl_global_max: 1_000_000,
+        }
     }
 }
 
@@ -127,6 +182,9 @@ pub struct ServerOpts {
     /// Admin identities (empty = rotation disabled).
     pub admin_ids: BTreeSet<String>,
     pub auto_create_keys: bool,
+    /// PRF surface (None = not mounted, the default — /sign-only tests run
+    /// exactly the pre-PRF deployment shape).
+    pub prf: Option<PrfOpts>,
 }
 
 impl Default for ServerOpts {
@@ -146,6 +204,7 @@ impl Default for ServerOpts {
             allowed_client_ids: BTreeSet::new(),
             admin_ids: BTreeSet::new(),
             auto_create_keys: true,
+            prf: None,
         }
     }
 }
@@ -172,6 +231,42 @@ pub async fn start_server(pki: &Pki, opts: ServerOpts) -> Server {
 
     let kek = Kek::from_encoded(&hex::encode([0x5au8; 32])).unwrap();
     let db = Arc::new(Db::open(&db_path).unwrap());
+
+    // PRF surface: exercise the REAL lifecycle — seal the fixed seed like
+    // init would, then load through the production boot policy (pin check +
+    // one-shot pairwise import included).
+    let (prf_state, prf_ids) = match &opts.prf {
+        Some(prf) => {
+            let pin = signet::dedup::seal_master_seed(&db, &kek, &prf.master_seed).unwrap();
+            let boot = prepare_prf_boot(
+                &db,
+                &kek,
+                PrfBootArgs {
+                    prf_clients_configured: !prf.client_ids.is_empty(),
+                    dedup_pubkey_pin: Some(&pin),
+                    import_pairwise: prf
+                        .pairwise_secret
+                        .as_ref()
+                        .map(|s| Zeroizing::new(s.clone())),
+                },
+            )
+            .expect("PRF boot policy must enable the surface");
+            let keys = match boot {
+                PrfBoot::Enabled(keys) => *keys,
+                PrfBoot::Disabled => panic!("PRF opts set but boot disabled the surface"),
+            };
+            (
+                Some(PrfState {
+                    keys,
+                    allowed_client_ids: prf.client_ids.clone(),
+                    rate_limiter: KeyRateLimiter::new(prf.rl_identity_max, prf.rl_global_max, 60),
+                }),
+                prf.client_ids.clone(),
+            )
+        }
+        None => (None, BTreeSet::new()),
+    };
+
     let keygen = KeygenService::new(
         db.clone(),
         kek.clone(),
@@ -186,11 +281,16 @@ pub async fn start_server(pki: &Pki, opts: ServerOpts) -> Server {
         keygen,
         auto_create_keys: opts.auto_create_keys,
         key_bits: opts.key_bits,
+        prf: prf_state,
     });
     let app = signet::router(state);
 
     let tls = signet::tls::build_server_config(&cert_path, &key_path, &ca_path).unwrap();
-    let policy = IdentityPolicy::new(opts.allowed_client_ids.clone(), opts.admin_ids.clone());
+    let policy = IdentityPolicy::new(
+        opts.allowed_client_ids.clone(),
+        opts.admin_ids.clone(),
+        prf_ids,
+    );
 
     // Bind an ephemeral port via std, learn the addr, then hand to the shared
     // identity-pinning serve path.
@@ -246,6 +346,17 @@ pub fn admin_client(pki: &Pki) -> reqwest::Client {
 /// to the CA but is not on a configured allow-list.
 pub fn other_client(pki: &Pki) -> reqwest::Client {
     client_with_identity(pki, &pki.other_cert_pem, &pki.other_key_pem)
+}
+
+/// A reqwest client presenting the PRF client certificate (CN minister).
+pub fn prf_client(pki: &Pki) -> reqwest::Client {
+    client_with_identity(pki, &pki.prf_cert_pem, &pki.prf_key_pem)
+}
+
+/// A reqwest client presenting the SAN-smuggling certificate (CN "sneaky-rp",
+/// DNS SAN "minister").
+pub fn san_smuggle_client(pki: &Pki) -> reqwest::Client {
+    client_with_identity(pki, &pki.san_smuggle_cert_pem, &pki.san_smuggle_key_pem)
 }
 
 /// A reqwest client with NO client certificate (should be rejected by mTLS).

@@ -1,14 +1,20 @@
-//! SQLite persistence: group keys (encrypted private key at rest) and the
+//! SQLite persistence: group keys (encrypted private key at rest), the
 //! issuance ledger that enforces one-signature-per-(group, participant,
-//! version) and feeds rate limiting / audit.
+//! version) and feeds rate limiting / audit, plus the PRF-surface tables —
+//! `service_keys` (KEK-sealed service key material) and `dedup_entries`
+//! (the credential dedup ledger, UNIQUE over the deterministic VOPRF output).
 //!
 //! Concurrency: a single write-serialized connection behind a mutex is the
 //! simplest race-safe design for this low-throughput service. The uniqueness
-//! invariant is additionally backed by a UNIQUE index, so even if the
-//! application logic were bypassed the database refuses a second issuance.
+//! invariants are additionally backed by UNIQUE indexes, so even if the
+//! application logic were bypassed the database refuses a second issuance /
+//! a second registration of the same dedup value.
 //!
 //! NEVER stored: the unblinded nonce, the blinded message, or any signature.
 //! The issuance row holds only (group_id, participant_id, version_id, ts).
+//! The dedup ledger stores only (entry_ref, value, owner_tag, badge_type, ts):
+//! `value` is a PRF output (never the raw anchor) and `owner_tag` is an opaque
+//! per-user handle minted by Minister (never a raw Minister userId).
 
 use crate::keystore::Kek;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -33,6 +39,65 @@ pub struct GroupKey {
     pub spki_der: Vec<u8>,
     /// Encrypted PKCS#8 blob (ciphertext at rest).
     pub sealed_pkcs8: Vec<u8>,
+}
+
+/// A row in the credential dedup ledger.
+pub struct DedupEntry {
+    /// Opaque 16-byte random primary key; the handle Minister stores as
+    /// `Badge.nullifierRef`.
+    pub entry_ref: Vec<u8>,
+    /// The deterministic stage-1 VOPRF output (`N_dedup`, 64 bytes). UNIQUE —
+    /// byte equality of this column IS the dedup comparison.
+    pub value: Vec<u8>,
+    /// Opaque per-user owner handle minted by Minister (never a raw userId).
+    pub owner_tag: String,
+    pub badge_type: String,
+}
+
+/// Outcome of a record-first dedup registration.
+pub enum DedupRegister {
+    /// The value was new; a fresh entry was recorded.
+    Registered { entry_ref: Vec<u8> },
+    /// The value already exists and is owned by the SAME owner tag
+    /// (re-issue / renewal); the existing entry ref is returned.
+    AlreadyYours { entry_ref: Vec<u8> },
+    /// The value already exists under a DIFFERENT owner tag: refused
+    /// (one-credential-one-account).
+    Taken,
+}
+
+/// Outcome of an owner-checked release.
+pub enum DedupRelease {
+    Released,
+    /// No such entry — treated as success by callers (idempotent retry).
+    NotFound,
+    /// The entry exists but is owned by a different tag: refused.
+    OwnerMismatch,
+}
+
+/// Outcome of an owner-checked, all-or-nothing batch reassign.
+pub enum DedupReassign {
+    /// Every listed ref is now owned by the target tag; `moved` counts the
+    /// rows whose owner actually changed in this call (refs already owned by
+    /// the target are idempotent no-ops).
+    Reassigned { moved: usize },
+    /// A listed ref does not exist; nothing was changed.
+    NotFound,
+    /// A listed ref is owned by neither the source nor the target tag;
+    /// nothing was changed.
+    OwnerMismatch,
+}
+
+/// Constant-time owner-handle equality for the dedup ledger's authorization
+/// compares (register/release/reassign classification and the disclose owner
+/// check). Handles are 128-bit random values minted by Minister and only
+/// PRF-allow-listed callers reach these paths, so a remote timing oracle is
+/// already impractical — but this is a crypto-core authorization compare, so
+/// it does not short-circuit on content. The length check inside `ct_eq` is
+/// the only data-dependent branch (handle length is not secret).
+pub(crate) fn owner_eq(a: &str, b: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    a.as_bytes().ct_eq(b.as_bytes()).into()
 }
 
 /// Current unix time in seconds.
@@ -115,6 +180,25 @@ impl Db {
                 ON issuances(participant_id, issued_at);
             CREATE INDEX IF NOT EXISTS idx_issuance_time
                 ON issuances(issued_at);
+
+            -- PRF-surface service keys, KEK-sealed (AES-GCM, AAD-bound to the
+            -- purpose string). NEVER plaintext key material.
+            CREATE TABLE IF NOT EXISTS service_keys (
+                purpose     TEXT PRIMARY KEY,
+                sealed      BLOB NOT NULL,
+                created_at  INTEGER NOT NULL
+            );
+
+            -- Credential dedup ledger: UNIQUE(value) is the dedup comparison
+            -- (byte equality of deterministic VOPRF outputs). entry_ref is an
+            -- opaque random handle; owner_tag an opaque per-user handle.
+            CREATE TABLE IF NOT EXISTS dedup_entries (
+                entry_ref   BLOB PRIMARY KEY,
+                value       BLOB NOT NULL UNIQUE,
+                owner_tag   TEXT NOT NULL,
+                badge_type  TEXT NOT NULL,
+                created_at  INTEGER NOT NULL
+            );
             "#,
         )
         .map_err(|e| e.to_string())?;
@@ -268,6 +352,188 @@ impl Db {
         .map_err(|e| e.to_string())
     }
 
+    // -----------------------------------------------------------------------
+    // PRF surface: service_keys
+    // -----------------------------------------------------------------------
+
+    /// Fetch the sealed blob for a service-key purpose, if present.
+    pub fn get_service_key(&self, purpose: &str) -> Result<Option<Vec<u8>>, String> {
+        let conn = self.lock_conn();
+        conn.query_row(
+            "SELECT sealed FROM service_keys WHERE purpose = ?1",
+            params![purpose],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())
+    }
+
+    /// Insert a sealed service key. Returns `false` (and stores nothing) if a
+    /// row for this purpose already exists — service keys are never silently
+    /// overwritten (key-fork prevention).
+    pub fn insert_service_key(&self, purpose: &str, sealed: &[u8]) -> Result<bool, String> {
+        let conn = self.lock_conn();
+        let res = conn.execute(
+            "INSERT INTO service_keys (purpose, sealed, created_at) VALUES (?1, ?2, ?3)",
+            params![purpose, sealed, now_secs()],
+        );
+        match res {
+            Ok(_) => Ok(true),
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // PRF surface: dedup ledger
+    // -----------------------------------------------------------------------
+
+    /// Record-first dedup registration, mirroring [`Db::reserve_issuance`]:
+    /// INSERT first and let `UNIQUE(value)` decide the race. On conflict the
+    /// existing row is fetched UNDER THE SAME CONNECTION LOCK and classified
+    /// by owner tag, so a concurrent register/release cannot interleave
+    /// between the insert attempt and the classification.
+    pub fn register_dedup(
+        &self,
+        entry_ref: &[u8],
+        value: &[u8],
+        owner_tag: &str,
+        badge_type: &str,
+    ) -> Result<DedupRegister, String> {
+        let conn = self.lock_conn();
+        let res = conn.execute(
+            "INSERT INTO dedup_entries (entry_ref, value, owner_tag, badge_type, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![entry_ref, value, owner_tag, badge_type, now_secs()],
+        );
+        match res {
+            Ok(_) => Ok(DedupRegister::Registered {
+                entry_ref: entry_ref.to_vec(),
+            }),
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                // UNIQUE(value) fired (an entry_ref PK collision is a 2^-128
+                // event; the None arm below fails it closed as an internal
+                // error rather than guessing).
+                let existing = conn
+                    .query_row(
+                        "SELECT entry_ref, owner_tag FROM dedup_entries WHERE value = ?1",
+                        params![value],
+                        |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)),
+                    )
+                    .optional()
+                    .map_err(|e| e.to_string())?;
+                match existing {
+                    Some((existing_ref, existing_owner))
+                        if owner_eq(&existing_owner, owner_tag) =>
+                    {
+                        Ok(DedupRegister::AlreadyYours {
+                            entry_ref: existing_ref,
+                        })
+                    }
+                    Some(_) => Ok(DedupRegister::Taken),
+                    None => Err(
+                        "dedup register hit a constraint but no row exists for the value \
+                         (entry_ref collision?)"
+                            .to_string(),
+                    ),
+                }
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// Fetch a dedup entry by its opaque ref.
+    pub fn dedup_entry_by_ref(&self, entry_ref: &[u8]) -> Result<Option<DedupEntry>, String> {
+        let conn = self.lock_conn();
+        conn.query_row(
+            "SELECT entry_ref, value, owner_tag, badge_type FROM dedup_entries \
+             WHERE entry_ref = ?1",
+            params![entry_ref],
+            |row| {
+                Ok(DedupEntry {
+                    entry_ref: row.get(0)?,
+                    value: row.get(1)?,
+                    owner_tag: row.get(2)?,
+                    badge_type: row.get(3)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|e| e.to_string())
+    }
+
+    /// Owner-checked release. The lookup and delete run under one connection
+    /// lock, so the owner check cannot race a concurrent re-registration.
+    pub fn release_dedup(&self, entry_ref: &[u8], owner_tag: &str) -> Result<DedupRelease, String> {
+        let conn = self.lock_conn();
+        let existing = conn
+            .query_row(
+                "SELECT owner_tag FROM dedup_entries WHERE entry_ref = ?1",
+                params![entry_ref],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        match existing {
+            None => Ok(DedupRelease::NotFound),
+            Some(owner) if !owner_eq(&owner, owner_tag) => Ok(DedupRelease::OwnerMismatch),
+            Some(_) => {
+                conn.execute(
+                    "DELETE FROM dedup_entries WHERE entry_ref = ?1",
+                    params![entry_ref],
+                )
+                .map_err(|e| e.to_string())?;
+                Ok(DedupRelease::Released)
+            }
+        }
+    }
+
+    /// Owner-checked batch reassign over an EXPLICIT ref list (merge / reverse
+    /// merge), all-or-nothing in one transaction. Each ref must be owned by
+    /// `from` (moved) or already by `to` (idempotent-retry no-op); any other
+    /// state rolls the whole batch back.
+    pub fn reassign_dedup(
+        &self,
+        entry_refs: &[Vec<u8>],
+        from: &str,
+        to: &str,
+    ) -> Result<DedupReassign, String> {
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let mut moved = 0usize;
+        for entry_ref in entry_refs {
+            let owner = tx
+                .query_row(
+                    "SELECT owner_tag FROM dedup_entries WHERE entry_ref = ?1",
+                    params![entry_ref],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            match owner {
+                None => return Ok(DedupReassign::NotFound), // tx drops -> rollback
+                Some(owner) if owner_eq(&owner, from) => {
+                    tx.execute(
+                        "UPDATE dedup_entries SET owner_tag = ?1 WHERE entry_ref = ?2",
+                        params![to, entry_ref],
+                    )
+                    .map_err(|e| e.to_string())?;
+                    moved += 1;
+                }
+                Some(owner) if owner_eq(&owner, to) => {} // already moved (retry) — no-op
+                Some(_) => return Ok(DedupReassign::OwnerMismatch), // rollback
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(DedupReassign::Reassigned { moved })
+    }
+
     /// Assert that no plaintext PKCS#8 is present in any stored key blob. Used
     /// by the at-rest test. A real PKCS#8 RSA private key DER begins with the
     /// SEQUENCE/INTEGER(version=0) prefix `30 82 .. .. 02 01 00`; AES-GCM
@@ -333,6 +599,15 @@ where
     )
     .map_err(|e| e.to_string())?;
     let key_id = tx.last_insert_rowid();
+    // AAD domain-separation invariant: group keys must never seal under
+    // key_id 0, which is reserved for the service_keys AAD (see
+    // dedup::SERVICE_KEY_ID). SQLite rowids start at 1, so this can only
+    // fire on a corrupted table — fail closed rather than seal ambiguously.
+    if key_id < 1 {
+        return Err(format!(
+            "group key rowid {key_id} violates the key_id >= 1 invariant"
+        ));
+    }
     let sealed = seal(key_id)?;
     let updated = tx
         .execute(
@@ -426,6 +701,185 @@ mod tests {
         // The new active blob opens under its own id.
         let opened = kek.open("g1", active.key_id, &active.sealed_pkcs8).unwrap();
         assert_eq!(opened, b"secret-2");
+    }
+
+    #[test]
+    fn service_key_insert_is_write_once() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(db.get_service_key("master-seed-v1").unwrap().is_none());
+        assert!(db
+            .insert_service_key("master-seed-v1", b"sealed-1")
+            .unwrap());
+        // A second insert for the same purpose must be refused, leaving the
+        // original blob untouched (never silently overwrite key material).
+        assert!(!db
+            .insert_service_key("master-seed-v1", b"sealed-2")
+            .unwrap());
+        assert_eq!(
+            db.get_service_key("master-seed-v1").unwrap().unwrap(),
+            b"sealed-1"
+        );
+    }
+
+    #[test]
+    fn dedup_register_already_yours_and_taken() {
+        let db = Db::open_in_memory().unwrap();
+        let value = [0xabu8; 64];
+        let r1 = db
+            .register_dedup(&[1u8; 16], &value, "owner-a", "email-domain")
+            .unwrap();
+        let ref1 = match r1 {
+            DedupRegister::Registered { entry_ref } => entry_ref,
+            _ => panic!("first register must be Registered"),
+        };
+        // Same value, same owner: already_yours with the SAME entry ref (the
+        // fresh candidate ref [2;16] must be discarded).
+        match db
+            .register_dedup(&[2u8; 16], &value, "owner-a", "email-domain")
+            .unwrap()
+        {
+            DedupRegister::AlreadyYours { entry_ref } => assert_eq!(entry_ref, ref1),
+            _ => panic!("same owner re-register must be AlreadyYours"),
+        }
+        // Same value, different owner: taken.
+        assert!(matches!(
+            db.register_dedup(&[3u8; 16], &value, "owner-b", "email-domain")
+                .unwrap(),
+            DedupRegister::Taken
+        ));
+    }
+
+    #[test]
+    fn dedup_register_race_has_exactly_one_winner() {
+        use std::sync::Arc;
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let value = Arc::new([0x11u8; 64]);
+        let mut handles = Vec::new();
+        for i in 0..16u8 {
+            let db = db.clone();
+            let value = value.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut entry_ref = [0u8; 16];
+                entry_ref[0] = i;
+                let owner = format!("owner-{i}");
+                db.register_dedup(&entry_ref, value.as_ref(), &owner, "oauth-account")
+                    .unwrap()
+            }));
+        }
+        let mut registered = 0;
+        let mut taken = 0;
+        for h in handles {
+            match h.join().unwrap() {
+                DedupRegister::Registered { .. } => registered += 1,
+                DedupRegister::Taken => taken += 1,
+                DedupRegister::AlreadyYours { .. } => panic!("distinct owners cannot own it"),
+            }
+        }
+        assert_eq!(registered, 1, "exactly one concurrent register may win");
+        assert_eq!(taken, 15, "all losers must see Taken");
+    }
+
+    #[test]
+    fn dedup_release_owner_checked_and_idempotent() {
+        let db = Db::open_in_memory().unwrap();
+        db.register_dedup(&[1u8; 16], &[0x22u8; 64], "owner-a", "email-domain")
+            .unwrap();
+        // Wrong owner: refused, row intact.
+        assert!(matches!(
+            db.release_dedup(&[1u8; 16], "owner-b").unwrap(),
+            DedupRelease::OwnerMismatch
+        ));
+        assert!(db.dedup_entry_by_ref(&[1u8; 16]).unwrap().is_some());
+        // Right owner: released.
+        assert!(matches!(
+            db.release_dedup(&[1u8; 16], "owner-a").unwrap(),
+            DedupRelease::Released
+        ));
+        assert!(db.dedup_entry_by_ref(&[1u8; 16]).unwrap().is_none());
+        // Releasing again: NotFound (idempotent retry surface).
+        assert!(matches!(
+            db.release_dedup(&[1u8; 16], "owner-a").unwrap(),
+            DedupRelease::NotFound
+        ));
+        // The value is registrable again after release.
+        assert!(matches!(
+            db.register_dedup(&[9u8; 16], &[0x22u8; 64], "owner-b", "email-domain")
+                .unwrap(),
+            DedupRegister::Registered { .. }
+        ));
+    }
+
+    #[test]
+    fn dedup_reassign_is_per_ref_owner_checked_and_atomic() {
+        let db = Db::open_in_memory().unwrap();
+        db.register_dedup(&[1u8; 16], &[1u8; 64], "donor", "email-domain")
+            .unwrap();
+        db.register_dedup(&[2u8; 16], &[2u8; 64], "donor", "oauth-account")
+            .unwrap();
+        db.register_dedup(&[3u8; 16], &[3u8; 64], "bystander", "email-domain")
+            .unwrap();
+
+        // A batch containing a ref owned by a third party must change NOTHING.
+        let refs: Vec<Vec<u8>> = vec![vec![1u8; 16], vec![3u8; 16]];
+        assert!(matches!(
+            db.reassign_dedup(&refs, "donor", "survivor").unwrap(),
+            DedupReassign::OwnerMismatch
+        ));
+        assert_eq!(
+            db.dedup_entry_by_ref(&[1u8; 16])
+                .unwrap()
+                .unwrap()
+                .owner_tag,
+            "donor",
+            "atomicity: the valid ref in a failed batch must not move"
+        );
+
+        // A batch with an unknown ref must also change nothing.
+        let refs: Vec<Vec<u8>> = vec![vec![1u8; 16], vec![0xffu8; 16]];
+        assert!(matches!(
+            db.reassign_dedup(&refs, "donor", "survivor").unwrap(),
+            DedupReassign::NotFound
+        ));
+
+        // The explicit donor refs move; the bystander's entry is untouched.
+        let refs: Vec<Vec<u8>> = vec![vec![1u8; 16], vec![2u8; 16]];
+        match db.reassign_dedup(&refs, "donor", "survivor").unwrap() {
+            DedupReassign::Reassigned { moved } => assert_eq!(moved, 2),
+            _ => panic!("reassign must succeed"),
+        }
+        assert_eq!(
+            db.dedup_entry_by_ref(&[1u8; 16])
+                .unwrap()
+                .unwrap()
+                .owner_tag,
+            "survivor"
+        );
+        assert_eq!(
+            db.dedup_entry_by_ref(&[3u8; 16])
+                .unwrap()
+                .unwrap()
+                .owner_tag,
+            "bystander"
+        );
+
+        // Retry after full success: idempotent (0 moved, still Reassigned).
+        match db.reassign_dedup(&refs, "donor", "survivor").unwrap() {
+            DedupReassign::Reassigned { moved } => assert_eq!(moved, 0),
+            _ => panic!("idempotent retry must succeed"),
+        }
+
+        // Reverse merge: exactly the recorded refs move back.
+        match db.reassign_dedup(&refs, "survivor", "donor").unwrap() {
+            DedupReassign::Reassigned { moved } => assert_eq!(moved, 2),
+            _ => panic!("reverse reassign must succeed"),
+        }
+        assert_eq!(
+            db.dedup_entry_by_ref(&[2u8; 16])
+                .unwrap()
+                .unwrap()
+                .owner_tag,
+            "donor"
+        );
     }
 
     #[test]

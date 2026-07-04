@@ -12,6 +12,8 @@
 *.pem
 *.key
 
-# Node interop deps (installed on demand by interop/run.sh)
+# Node interop deps (installed on demand by interop/run.sh + interop/run-prf.sh)
 /interop/node/node_modules
 /interop/node/package-lock.json
+/interop/node_modules
+/interop/package-lock.json
