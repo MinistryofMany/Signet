@@ -26,8 +26,14 @@ fn info(version: &str) -> Vec<u8> {
 
 /// Fetch the active public key, polling `GET /key` until the async keygen
 /// reports the key ready. The first call typically returns 202 pending.
+///
+/// Ceiling 3600 x 100ms ~ 360s: all five tests here run in parallel, each with
+/// its own 2048-bit safe-prime keygen (the scheme rejects smaller moduli), so
+/// on a slow shared CI runner a single key can take minutes to come ready. The
+/// poll exits as soon as the key is ready; the ceiling only spends wall clock
+/// on degraded runners instead of failing.
 async fn fetch_pubkey(client: &reqwest::Client, base: &str, group: &str) -> PubKey {
-    for _ in 0..1200 {
+    for _ in 0..3600 {
         let res = client
             .get(format!("{base}/key?group_id={group}"))
             .send()
