@@ -98,10 +98,20 @@ fn env_or<T: std::str::FromStr>(key: &str, default: T) -> Result<T, String> {
 }
 
 /// Consume `SIGNET_KEK` from the environment: parse it, zeroize the raw copy,
-/// and remove the variable so it is not readable via /proc/<pid>/environ,
-/// inherited by a child process, or surfaced by a crash dump walking the
-/// environment block. The returned in-memory [`Kek`] is the only remaining
-/// copy and is itself zeroized on drop.
+/// and remove the variable so it is not inherited by child processes and not
+/// readable through `std::env` for the rest of this process's lifetime. The
+/// returned in-memory [`Kek`] is the intended remaining copy and is zeroized
+/// on drop.
+///
+/// KNOWN RESIDUAL (bounded, accepted): `remove_var` mutates only the runtime
+/// environ copy. On Linux, `/proc/<pid>/environ` exposes the INITIAL
+/// exec-time environment block (`mm->env_start..env_end`), so the original
+/// secret bytes remain readable there — and in a core dump's environment
+/// region — for the process lifetime. Reading it requires ptrace-level
+/// access to this process (same-UID or CAP_SYS_PTRACE), so this does not
+/// weaken the mTLS/at-rest boundaries, but it is why the deployment runbook
+/// should prefer file/fd secret delivery (read-then-shred) over the
+/// environment for the most sensitive imports.
 ///
 /// SAFETY: `remove_var` is sound here because this is called from `main`
 /// BEFORE the tokio runtime is built (audit L1) — for the serve path via
