@@ -5,7 +5,7 @@ edition = "2021"
 # 1.87: usize::is_multiple_of (used in config.rs key-bits validation) was
 # stabilized in 1.87. The codebase already relies on it, so this is the true
 # minimum supported version.
-rust-version = "1.87"
+rust-version = "1.88"
 description = "Hardened partially-blind RSA signing service for FreedInk vote tokens"
 license = "MIT"
 publish = false
